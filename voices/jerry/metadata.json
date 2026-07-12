@@ -1,0 +1,6 @@
+{
+  "voice_id": "jerry",
+  "name": "Jerry",
+  "prompt_text": "大家好，欢迎来到 Bevy 塔防教学。这一行代码定义了 23 列 13 行的瓦片地图，用 AssetServer 加载资源。",
+  "created_at": "2026-07-12T00:00:00+00:00"
+}

@@ -1,0 +1,64 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Outputs and logs
+output/
+outputs/
+outputs_*/
+logs/
+wandb/
+exp/
+pretrained_models/
+model_cache/
+
+# Checkpoints and large models
+ckpt/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+!frontend/campplus.onnx
+
+# Audio (uploads/outputs only; keep bundled voices)
+*.wav
+*.mp3
+*.flac
+*.aac
+*.ogg
+!voices/**/*.wav
+!voices/**/metadata.json
+
+# Documentation and assets
+*.md
+assets/
+examples/
+
+# CI / config files not needed at runtime
+.github/
+.gitignore
+.pylintrc
+.pre-commit-config.yaml
