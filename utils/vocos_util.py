@@ -13,6 +13,7 @@
 # limitations under the License.
 import torch
 import torch.jit
+import os
 import pathlib
 from typing import Union
 
@@ -53,8 +54,8 @@ class Vocos2DInference:
         xs_mel_tr: torch.Tensor = xs_mel.transpose(-1, -2) - MEL_LOGDIFF
         return xs_mel_tr
 
-def load_vocos_jit(device: str = "cuda") -> Vocos2DInference:
+def load_vocos_jit(device: str = "cuda", model_dir: str = "ckpt") -> Vocos2DInference:
     """Factory function to load Vocos model"""
-    ckpt_path = 'ckpt/vocos2d/generator_jit.ckpt'
+    ckpt_path = os.path.join(model_dir, "vocos2d", "generator_jit.ckpt")
     print(f"Loading Vocos JIT model from {ckpt_path} on {device}...")
     return Vocos2DInference(ckpt_path, device=device)

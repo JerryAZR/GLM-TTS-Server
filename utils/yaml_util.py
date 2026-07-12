@@ -36,7 +36,7 @@ def load_flow_model(flow_ckpt_path, config_path, device):
     flow.eval()
     return flow
 
-def load_quantize_encoder(model_path):
+def load_quantize_encoder(model_path, device='cuda'):
     print(f'[load_quantize_encoder] start. {model_path=}')
     config = WhisperVQConfig.from_pretrained(model_path)
     config.quantize_encoder_only = True
@@ -56,10 +56,10 @@ def load_quantize_encoder(model_path):
                     state_dict[new_key] = f.get_tensor(key)
     model.load_state_dict(state_dict)
     model.eval()
-    model.cuda()
+    model.to(device)
     return model
 
-def load_speech_tokenizer(model_path):
-    model = load_quantize_encoder(model_path)
+def load_speech_tokenizer(model_path, device='cuda'):
+    model = load_quantize_encoder(model_path, device=device)
     feature_extractor = WhisperFeatureExtractor.from_pretrained(model_path)
     return model, feature_extractor

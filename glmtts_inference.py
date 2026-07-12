@@ -107,7 +107,7 @@ def _assert_shape_and_get_len(token):
     token_len = torch.tensor([token.shape[1]], dtype=torch.int32).to(token.device)
     return token_len
 
-def load_frontends(speech_tokenizer, sample_rate=24000, use_phoneme=False, frontend_dir="frontend"):
+def load_frontends(speech_tokenizer, sample_rate=24000, use_phoneme=False, frontend_dir="frontend", device=DEVICE, model_dir="ckpt"):
     if sample_rate == 32000:
         feat_extractor = partial(mel_spectrogram, sampling_rate=sample_rate, hop_size=640, n_fft=2560, num_mels=80, win_size=2560, fmin=0, fmax=8000, center=False)
         print("Configured for 32kHz frontend.")
@@ -118,7 +118,7 @@ def load_frontends(speech_tokenizer, sample_rate=24000, use_phoneme=False, front
         raise ValueError(f"Unsupported sampling_rate: {sample_rate}")
 
     glm_tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join('ckpt', 'vq32k-phoneme-tokenizer'), trust_remote_code=True
+        os.path.join(model_dir, 'vq32k-phoneme-tokenizer'), trust_remote_code=True
     )
 
     tokenize_fn = lambda text: glm_tokenizer.encode(text)
@@ -129,7 +129,7 @@ def load_frontends(speech_tokenizer, sample_rate=24000, use_phoneme=False, front
         feat_extractor,
         os.path.join(frontend_dir, "campplus.onnx"),
         os.path.join(frontend_dir, "spk2info.pt"),
-        DEVICE,
+        device,
     )
     text_frontend = TextFrontEnd(use_phoneme)
     return frontend, text_frontend
@@ -331,8 +331,11 @@ def generate_long(
 
 
 def jsonl_generate(
-    data_name, folder_path, sample_rate=24000, seed=0, use_cache=True, use_phoneme=False
+    data_name, folder_path, sample_rate=24000, seed=0, use_cache=True, use_phoneme=False, device=None
 ):
+    if device is None:
+        device = get_device_from_env()
+
     # Dataset path resolution
     jsonl_path = os.path.join("examples", data_name + ".jsonl")
 
@@ -360,7 +363,7 @@ def jsonl_generate(
                 cache_speech_token = [prompt_speech_token.squeeze().tolist()]
                 flow_prompt_token = torch.tensor(
                     cache_speech_token, dtype=torch.int32
-                ).to(DEVICE)
+                ).to(device)
 
                 # Initialize Cache
                 cache = {
@@ -384,7 +387,7 @@ def jsonl_generate(
                     seed=seed,
                     flow_prompt_token=flow_prompt_token,
                     speech_feat=speech_feat,
-                    device=DEVICE,
+                    device=device,
                     use_phoneme=use_phoneme,
                 )
                 f_out.write(
@@ -410,38 +413,71 @@ def jsonl_generate(
                 # Optional: raise e # Uncomment to stop on first error
 
 
-def load_models(use_phoneme=False, sample_rate=24000):
-    # Load Speech Tokenizer
-    speech_tokenizer_path = os.path.join("ckpt", "speech_tokenizer")
+def get_device_from_env(fallback: str = "auto") -> torch.device:
+    """Return a torch.device honoring GLM_TTS_DEVICE, or fallback if unset."""
+    env = os.environ.get("GLM_TTS_DEVICE", fallback)
+    if env is None or env.lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(env)
+
+
+def get_dtype_from_env(fallback: str = "float32") -> torch.dtype:
+    """Return a torch.dtype honoring GLM_TTS_DTYPE, or fallback if unset."""
+    env = os.environ.get("GLM_TTS_DTYPE", fallback)
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return mapping.get(env.lower(), torch.float32)
+
+
+def load_models(use_phoneme=False, sample_rate=24000, device=None, dtype=None, model_dir=None):
+    if device is None:
+        device = get_device_from_env()
+    if dtype is None:
+        dtype = get_dtype_from_env()
+    if model_dir is None:
+        model_dir = os.environ.get("GLM_TTS_MODEL_DIR", "ckpt")
+
+    # Load Speech Tokenizer (keep fp32 for feature-extractor compatibility)
+    speech_tokenizer_path = os.path.join(model_dir, "speech_tokenizer")
     _model, _feature_extractor = yaml_util.load_speech_tokenizer(
-        speech_tokenizer_path
+        speech_tokenizer_path, device=device
     )
-    speech_tokenizer = SpeechTokenizer(_model, _feature_extractor)
+    speech_tokenizer = SpeechTokenizer(_model, _feature_extractor, device=device)
 
     # Load Frontends
-    frontend, text_frontend = load_frontends(speech_tokenizer, sample_rate=sample_rate, use_phoneme=use_phoneme)
+    frontend, text_frontend = load_frontends(
+        speech_tokenizer, sample_rate=sample_rate, use_phoneme=use_phoneme, frontend_dir="frontend", device=device, model_dir=model_dir
+    )
 
-    llama_path = os.path.join("ckpt", "llm")
+    llama_path = os.path.join(model_dir, "llm")
 
     llm = GLMTTS(
         llama_cfg_path=os.path.join(llama_path, "config.json"), mode="PRETRAIN"
     )
     llm.llama = LlamaForCausalLM.from_pretrained(
-        llama_path, dtype=torch.float32
-    ).to(DEVICE)
+        llama_path, torch_dtype=dtype
+    ).to(device)
 
     llm.llama_embedding = llm.llama.model.embed_tokens
 
     special_token_ids = get_special_token_ids(frontend.tokenize_fn)
     llm.set_runtime_vars(special_token_ids=special_token_ids)
 
-    flow_ckpt = os.path.join("ckpt", "flow", "flow.pt")
-    flow_config = os.path.join("ckpt", "flow", "config.yaml")
-    flow = yaml_util.load_flow_model(
-        flow_ckpt, flow_config, DEVICE
-    )
+    flow_ckpt = os.path.join(model_dir, "flow", "flow.pt")
+    flow_config = os.path.join(model_dir, "flow", "config.yaml")
+    flow = yaml_util.load_flow_model(flow_ckpt, flow_config, device)
 
-    token2wav = tts_model_util.Token2Wav(flow, sample_rate=sample_rate, device=DEVICE)
+    token2wav = tts_model_util.Token2Wav(
+        flow, sample_rate=sample_rate, device=device, model_dir=model_dir
+    )
+    # Keep vocoder in fp32 to match the flow output.
 
     return frontend, text_frontend, speech_tokenizer, llm, token2wav
 
@@ -459,9 +495,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load Models
+    device = get_device_from_env()
     frontend, text_frontend, speech_tokenizer, llm, flow = load_models(
         use_phoneme=args.use_phoneme,
-        sample_rate=args.sample_rate
+        sample_rate=args.sample_rate,
+        device=device,
     )
 
     # Create Output Directory
@@ -473,5 +511,5 @@ if __name__ == "__main__":
 
     # Run Inference
     jsonl_generate(
-        args.data, folder_path, sample_rate=args.sample_rate, use_cache=args.use_cache, use_phoneme=args.use_phoneme
+        args.data, folder_path, sample_rate=args.sample_rate, use_cache=args.use_cache, use_phoneme=args.use_phoneme, device=device
     )

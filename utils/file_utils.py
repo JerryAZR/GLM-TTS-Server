@@ -15,16 +15,16 @@ import torchaudio
 import json
 import os
 
-def load_wav(wav, target_sr):
+def load_wav(wav, target_sr, device="cuda"):
     speech, sample_rate = torchaudio.load(wav)
-    speech = speech.to("cuda")
+    speech = speech.to(device)
     speech = speech.mean(dim=0, keepdim=True)
     if sample_rate != target_sr:
         resampler = torchaudio.transforms.Resample(
                     orig_freq=sample_rate,
                     new_freq=target_sr
-                ).to('cuda')
-        speech = resampler(speech).to("cuda")
+                ).to(device)
+        speech = resampler(speech).to(device)
     return speech
 
 def get_jsonl(jsonl_file_path=None):
