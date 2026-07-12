@@ -62,3 +62,7 @@ examples/
 .gitignore
 .pylintrc
 .pre-commit-config.yaml
+tests/
+.venv/
+venv/
+env/

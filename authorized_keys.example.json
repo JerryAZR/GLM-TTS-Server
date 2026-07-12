@@ -1,0 +1,10 @@
+{
+  "keys": [
+    {
+      "kid": "example-key",
+      "name": "Example tenant",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyJxP7ZqS2b...\n-----END PUBLIC KEY-----",
+      "scopes": ["speech:generate", "voices:read", "voices:manage"]
+    }
+  ]
+}

@@ -32,10 +32,10 @@ import torchaudio
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
+from api.auth import load_authorized_keys, verify_auth, AUTH_KEYS_FILE
 from glmtts_inference import generate_long, get_device_from_env, get_dtype_from_env, load_models
 
 logging.basicConfig(
@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 # Environment configuration
 # ---------------------------------------------------------------------------
 
-API_KEY = os.environ.get("GLM_TTS_API_KEY", "")
 MODEL_DIR = os.environ.get("GLM_TTS_MODEL_DIR", "")
 if not MODEL_DIR:
     MODEL_DIR = "/workspace/ckpt" if Path("/workspace/ckpt").exists() else "ckpt"
@@ -68,24 +67,10 @@ SAMPLE_RATE = int(os.environ.get("GLM_TTS_SAMPLE_RATE", "24000"))
 MAX_UPLOAD_BYTES = int(os.environ.get("GLM_TTS_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 # ---------------------------------------------------------------------------
-# FastAPI / security
+# FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="GLM-TTS Server", version="0.1.0")
-security = HTTPBearer(auto_error=False)
-
-
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> None:
-    if not API_KEY:
-        return
-    token = credentials.credentials if credentials else ""
-    if not token.startswith("Bearer "):
-        token = f"Bearer {token}"
-    if token != f"Bearer {API_KEY}":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Voice registry
@@ -307,6 +292,7 @@ async def _load_engine() -> None:
 
 @app.on_event("startup")
 async def on_startup():
+    load_authorized_keys(AUTH_KEYS_FILE)
     scan_voices()
     asyncio.create_task(_load_engine())
 
@@ -329,7 +315,7 @@ def ready():
 
 
 @app.get("/v1/models")
-def list_models(_=Depends(verify_api_key)):
+def list_models(_=Depends(verify_auth())):
     return {"data": [{"id": "glm-tts", "object": "model", "owned_by": "zai-org"}]}
 
 
@@ -342,7 +328,7 @@ class SpeechRequest(BaseModel):
 
 
 @app.post("/v1/audio/speech")
-async def create_speech(req: SpeechRequest, _=Depends(verify_api_key)):
+async def create_speech(req: SpeechRequest, _=Depends(verify_auth(["speech:generate"]))):
     if not ENGINE.ready:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -378,7 +364,7 @@ async def create_voice(
     prompt_text: str = Form(...),
     prompt_audio: UploadFile = File(...),
     voice_id: Optional[str] = Form(None),
-    _=Depends(verify_api_key),
+    _=Depends(verify_auth(["voices:manage"])),
 ):
     if not voice_id:
         voice_id = f"voice_{uuid.uuid4().hex[:12]}"
@@ -443,7 +429,7 @@ async def create_voice(
 
 
 @app.get("/v1/voices")
-def list_voices(_=Depends(verify_api_key)):
+def list_voices(_=Depends(verify_auth(["voices:read"]))):
     return {
         "voices": [
             {
@@ -457,7 +443,7 @@ def list_voices(_=Depends(verify_api_key)):
 
 
 @app.get("/v1/voices/{voice_id}")
-def get_voice(voice_id: str, _=Depends(verify_api_key)):
+def get_voice(voice_id: str, _=Depends(verify_auth(["voices:read"]))):
     if voice_id not in VOICE_REGISTRY:
         raise HTTPException(status_code=404, detail="Voice not found")
     v = VOICE_REGISTRY[voice_id]
@@ -470,7 +456,7 @@ def get_voice(voice_id: str, _=Depends(verify_api_key)):
 
 
 @app.delete("/v1/voices/{voice_id}")
-async def delete_voice(voice_id: str, _=Depends(verify_api_key)):
+async def delete_voice(voice_id: str, _=Depends(verify_auth(["voices:manage"]))):
     async with VOICE_LOCK:
         if voice_id not in VOICE_REGISTRY:
             raise HTTPException(status_code=404, detail="Voice not found")

@@ -40,6 +40,7 @@ fastapi==0.115.6
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.5
 pydantic==2.12.4
+PyJWT[crypto]==2.8.0
 
 # HuggingFace download helper
 huggingface-hub>=0.23.0
