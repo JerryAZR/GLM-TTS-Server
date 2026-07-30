@@ -1,6 +1,8 @@
 # JWT public-key authentication tests.
 # These tests run in mock mode and use a generated RSA key pair.
 
+import importlib
+import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -35,23 +37,35 @@ def key_pair():
 
 
 @pytest.fixture(scope="module")
-def auth_client(key_pair):
+def auth_client(key_pair, tmp_path_factory):
     public_key, private_key = key_pair
+    # Enroll the key through the real path: a keys file on disk that the
+    # server loads during startup (load_authorized_keys clears in-memory
+    # state, so enrolling directly before startup would be wiped).
+    keys_file = tmp_path_factory.mktemp("auth") / "authorized_keys.json"
+    keys_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "kid": "test-key",
+                        "name": "Test",
+                        "public_key": public_key,
+                        "scopes": ["speech:generate", "voices:read", "voices:manage"],
+                    }
+                ]
+            }
+        )
+    )
+
     os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
-    os.environ["GLM_TTS_AUTH_KEYS_FILE"] = "/nonexistent/authorized_keys.json"
+    os.environ["GLM_TTS_AUTH_KEYS_FILE"] = str(keys_file)
 
-    import api.server as server
     import api.auth as auth
-    import importlib
+    import api.server as server
 
-    importlib.reload(server)
-    auth.AUTHORIZED_KEYS = {
-        "test-key": {
-            "public_key": public_key,
-            "scopes": {"speech:generate", "voices:read", "voices:manage"},
-            "name": "Test",
-        }
-    }
+    importlib.reload(auth)  # re-read GLM_TTS_AUTH_KEYS_FILE
+    importlib.reload(server)  # re-import AUTH_KEYS_FILE from the reloaded auth
 
     with TestClient(server.app) as c:
         deadline = time.time() + 10
