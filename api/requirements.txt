@@ -16,7 +16,9 @@ soundfile==0.12.1
 librosa==0.9.2
 pydub==0.25.1
 onnxruntime_gpu==1.18.0
-openai_whisper==20231117
+# NOTE: openai_whisper is intentionally NOT here — it is only imported by the
+# grpo/ RL-training code (kept in the full requirements.txt), not by inference,
+# and its sdist no longer builds with modern setuptools.
 
 # Chinese/English text processing
 WeTextProcessing==1.0.3
