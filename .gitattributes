@@ -1,0 +1,9 @@
+# Default: let git normalize line endings on commit, check out per-platform.
+*           text=auto
+
+# Shell scripts and the Dockerfile must keep LF line endings even on Windows:
+# the container entrypoint breaks if they are saved with CRLF.
+# (Later rules win over earlier ones, so these must come after `*`.)
+*.sh        text eol=lf
+*.bash      text eol=lf
+Dockerfile  text eol=lf

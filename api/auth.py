@@ -1,14 +1,16 @@
 """
 Authentication helpers for the GLM-TTS API server.
 
-Supports two modes (mutually exclusive):
-  1. Public-key JWT auth (preferred): load a JSON file of authorized public keys
-     via GLM_TTS_AUTH_KEYS_FILE. Clients send a short-lived JWT signed with
-     their private key. The server only stores public keys, never secrets.
-  2. Legacy single-secret Bearer token: GLM_TTS_API_KEY (kept for backwards
-     compatibility and local testing).
+Public-key JWT auth: the server loads a JSON file of authorized public keys
+(via GLM_TTS_AUTH_KEYS_FILE). Clients send short-lived JWTs signed with their
+own private keys. The server only stores public keys, never secrets.
 
-If neither is configured, all /v1 endpoints are public.
+Public keys may be PEM ("-----BEGIN PUBLIC KEY-----") or single-line OpenSSH
+format ("ssh-ed25519 AAAA...", "ssh-rsa AAAA...", ...), so the file works
+much like SSH's own authorized_keys: generate a key with ssh-keygen and
+paste the .pub line.
+
+If no keys are configured, all /v1 endpoints are public.
 """
 
 from __future__ import annotations
@@ -22,10 +24,10 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
 
-LEGACY_API_KEY = os.environ.get("GLM_TTS_API_KEY", "")
 AUTH_KEYS_FILE = os.environ.get("GLM_TTS_AUTH_KEYS_FILE", "")
 if not AUTH_KEYS_FILE:
     AUTH_KEYS_FILE = (
@@ -50,6 +52,14 @@ JWT_ALGORITHMS: List[str] = [
 security = HTTPBearer(auto_error=False)
 
 
+def _load_public_key(key_text: str):
+    """Load a PEM or OpenSSH-format (e.g. ssh-ed25519) public key."""
+    data = key_text.strip().encode()
+    if data.startswith((b"ssh-", b"ecdsa-")):
+        return serialization.load_ssh_public_key(data)
+    return serialization.load_pem_public_key(data)
+
+
 def load_authorized_keys(path: str) -> None:
     """Load pre-enrolled public keys from a JSON file."""
     key_path = Path(path)
@@ -72,22 +82,18 @@ def load_authorized_keys(path: str) -> None:
                 f"Skipping authorized-key entry missing 'kid' or 'public_key': {entry}"
             )
             continue
+        try:
+            key_obj = _load_public_key(public_key)
+        except Exception as exc:
+            logger.warning(f"Skipping authorized-key entry '{kid}' (bad key): {exc}")
+            continue
         AUTHORIZED_KEYS[kid] = {
-            "public_key": public_key,
+            "public_key": key_obj,
             "scopes": set(entry.get("scopes", [])),
             "name": entry.get("name", ""),
         }
 
     logger.info(f"Loaded {len(AUTHORIZED_KEYS)} authorized public key(s) from {path}")
-
-
-def _legacy_verify(token: str) -> bool:
-    """Check the token against the legacy GLM_TTS_API_KEY."""
-    if not LEGACY_API_KEY:
-        return True
-    if not token.startswith("Bearer "):
-        token = f"Bearer {token}"
-    return token == f"Bearer {LEGACY_API_KEY}"
 
 
 def _verify_jwt(token: str, required_scopes: List[str]) -> Dict[str, Any]:
@@ -147,17 +153,17 @@ def _verify_jwt(token: str, required_scopes: List[str]) -> Dict[str, Any]:
 def verify_auth(required_scopes: Optional[List[str]] = None):
     """
     FastAPI dependency factory.
-    If public keys are configured, require a signed JWT.
-    Otherwise fall back to the legacy API key.
-    Returns the JWT payload (or an empty dict for legacy auth).
+    If public keys are configured, require a signed JWT; otherwise the
+    endpoint is public. Returns the JWT payload (or an empty dict when
+    no auth is configured).
     """
     required_scopes = required_scopes or []
 
     async def _verify(
         credentials: HTTPAuthorizationCredentials = Depends(security),
     ) -> Dict[str, Any]:
-        # If no auth is configured at all, the server is public.
-        if not LEGACY_API_KEY and not AUTHORIZED_KEYS:
+        # If no public keys are configured, the server is public.
+        if not AUTHORIZED_KEYS:
             return {}
 
         token = credentials.credentials if credentials else ""
@@ -167,16 +173,8 @@ def verify_auth(required_scopes: Optional[List[str]] = None):
                 detail="Missing Authorization header",
             )
 
-        # Prefer JWT auth when public keys are configured.
-        if AUTHORIZED_KEYS:
-            if not token.startswith("Bearer "):
-                token = f"Bearer {token}"
-            return _verify_jwt(token, required_scopes)
-        if not _legacy_verify(token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid API key",
-            )
-        return {}
+        if not token.startswith("Bearer "):
+            token = f"Bearer {token}"
+        return _verify_jwt(token, required_scopes)
 
     return _verify

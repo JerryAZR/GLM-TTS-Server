@@ -39,9 +39,21 @@ jobs:
 
       - name: Run mock container and verify endpoints
         run: |
+          # The image ships a real authorized_keys.json (baked in from the repo
+          # root), so API requests need a token. Enroll a throwaway CI key via
+          # the volume path, which takes precedence over the baked-in file.
+          ssh-keygen -t ed25519 -f ci-key -N "" -q
+          mkdir -p ci-workspace
+          cat > ci-workspace/authorized_keys.json <<EOF
+          { "keys": [ { "kid": "ci", "public_key": "$(cat ci-key.pub)", "scopes": ["speech:generate", "voices:read", "voices:manage"] } ] }
+          EOF
+          pip install --quiet PyJWT cryptography
+          TOKEN=$(python scripts/make_token.py --key ci-key --kid ci --expires 600)
+
           docker run -d --rm \
             -p 8000:8000 \
             -e GLM_TTS_MOCK_INFERENCE=1 \
+            -v "$(pwd)/ci-workspace:/workspace" \
             --name glm-tts-test \
             glm-tts-server:test
           # Wait for the non-blocking startup to finish.
@@ -51,8 +63,41 @@ jobs:
             fi
             sleep 1
           done
+          # Public endpoints need no token.
           curl -f http://localhost:8000/health
           curl -f http://localhost:8000/ready
-          curl -f http://localhost:8000/v1/models
-          curl -f http://localhost:8000/v1/voices
+          # /v1 endpoints require a valid JWT now.
+          curl -f -H "Authorization: Bearer ${TOKEN}" http://localhost:8000/v1/models
+          curl -f -H "Authorization: Bearer ${TOKEN}" http://localhost:8000/v1/voices
+          # Without a token they must reject with 401.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v1/models)" = "401"
           docker stop glm-tts-test
+
+  push-image:
+    # Push the smoke-tested image to GHCR so RunPod can pull it directly.
+    needs: [test, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the image name (GHCR requirement)
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          docker build -t "${IMAGE_NAME}:latest" -t "${IMAGE_NAME}:sha-${GITHUB_SHA::7}" .
+          docker push "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA::7}"

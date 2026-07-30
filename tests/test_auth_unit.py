@@ -1,6 +1,6 @@
 # Unit tests for api/auth.py.
 # These tests do not import the heavy TTS model stack; they only exercise the
-# JWT and legacy-API-key verification logic.
+# JWT public-key verification logic.
 
 import asyncio
 import json
@@ -10,18 +10,16 @@ from datetime import datetime, timezone, timedelta
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, ed25519
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 
-os.environ["GLM_TTS_API_KEY"] = ""
 os.environ["GLM_TTS_AUTH_KEYS_FILE"] = "/nonexistent/authorized_keys.json"
 
 from api.auth import (
     AUTHORIZED_KEYS,
     load_authorized_keys,
     _verify_jwt,
-    _legacy_verify,
     verify_auth,
 )
 
@@ -64,10 +62,8 @@ def reset_auth_keys():
     import api.auth as auth
 
     auth.AUTHORIZED_KEYS.clear()
-    auth.LEGACY_API_KEY = ""
     yield
     auth.AUTHORIZED_KEYS.clear()
-    auth.LEGACY_API_KEY = ""
 
 
 @pytest.fixture
@@ -129,26 +125,75 @@ def test_verify_jwt_wrong_signature(key_file):
     assert exc_info.value.status_code == 401
 
 
+def test_load_authorized_keys_openssh_ed25519(tmp_path):
+    """OpenSSH-format public keys (ssh-keygen output) work with EdDSA JWTs."""
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    ssh_pub_line = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode()
+    path = tmp_path / "authorized_keys.json"
+    path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "kid": "ssh-key",
+                        # Trailing comment, as found in real .pub files.
+                        "public_key": f"{ssh_pub_line} user@host",
+                        "scopes": ["speech:generate"],
+                    }
+                ]
+            }
+        )
+    )
+    load_authorized_keys(str(path))
+    assert "ssh-key" in AUTHORIZED_KEYS
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": "test-user",
+            "iat": now,
+            "exp": now + timedelta(hours=1),
+            "scopes": ["speech:generate"],
+        },
+        private_key,
+        algorithm="EdDSA",
+        headers={"kid": "ssh-key"},
+    )
+    payload = _verify_jwt(f"Bearer {token}", ["speech:generate"])
+    assert payload["sub"] == "test-user"
+
+
+def test_load_authorized_keys_skips_bad_entries(tmp_path):
+    """Entries with unparseable keys are skipped, not fatal."""
+    path = tmp_path / "authorized_keys.json"
+    path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {"kid": "bad-key", "public_key": "not-a-key", "scopes": []},
+                    {
+                        "kid": "good-key",
+                        "public_key": PUBLIC_KEY,
+                        "scopes": ["speech:generate"],
+                    },
+                ]
+            }
+        )
+    )
+    load_authorized_keys(str(path))
+    assert "bad-key" not in AUTHORIZED_KEYS
+    assert "good-key" in AUTHORIZED_KEYS
+
+
 def test_verify_jwt_unknown_kid(key_file):
     load_authorized_keys(str(key_file))
     token = _make_token(kid="unknown-key")
     with pytest.raises(HTTPException) as exc_info:
         _verify_jwt(f"Bearer {token}", [])
     assert exc_info.value.status_code == 401
-
-
-def test_legacy_verify(monkeypatch):
-    monkeypatch.setenv("GLM_TTS_API_KEY", "secret")
-    # LEGACY_API_KEY is read at import time; reload to pick up the env var.
-    import importlib
-    import api.auth
-
-    importlib.reload(api.auth)
-    from api.auth import _legacy_verify
-
-    assert _legacy_verify("secret") is True
-    assert _legacy_verify("Bearer secret") is True
-    assert _legacy_verify("wrong") is False
 
 
 @pytest.mark.asyncio

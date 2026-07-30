@@ -13,10 +13,16 @@ echo "[runpod-start] HF_REPO=${HF_REPO}"
 echo "[runpod-start] PORT=${PORT}"
 
 # If the model directory is missing or empty, try to download weights from HuggingFace.
-if [ ! -d "${MODEL_DIR}" ] || [ -z "$(ls -A "${MODEL_DIR}" 2>/dev/null)" ]; then
+# Skipped in mock-inference mode, which never loads weights (keeps CI and local
+# mock runs from pulling multi-GB checkpoints).
+if [ "${GLM_TTS_MOCK_INFERENCE:-0}" = "1" ]; then
+    echo "[runpod-start] Mock inference mode; skipping model download."
+elif [ ! -d "${MODEL_DIR}" ] || [ -z "$(ls -A "${MODEL_DIR}" 2>/dev/null)" ]; then
     echo "[runpod-start] Model directory is empty. Downloading from ${HF_REPO} ..."
     mkdir -p "${MODEL_DIR}"
-    huggingface-cli download "${HF_REPO}" --local-dir "${MODEL_DIR}" --local-dir-use-symlinks False
+    # Note: --local-dir-use-symlinks was removed in huggingface_hub >= 0.26;
+    # --local-dir now always writes real files, so no flag is needed.
+    huggingface-cli download "${HF_REPO}" --local-dir "${MODEL_DIR}"
     echo "[runpod-start] Model download complete."
 else
     echo "[runpod-start] Reusing existing model directory."

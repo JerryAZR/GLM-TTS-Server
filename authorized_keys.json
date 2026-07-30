@@ -1,0 +1,10 @@
+{
+  "keys": [
+    {
+      "kid": "zerui",
+      "name": "zerui.an@outlook.com",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0mUW/SOJbZUGc3pLCKNbl366zN0IM+Y/fMceNNcCdJ zerui.an@outlook.com",
+      "scopes": ["speech:generate", "voices:read", "voices:manage"]
+    }
+  ]
+}

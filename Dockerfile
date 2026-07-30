@@ -7,7 +7,7 @@
 # Run locally with real weights:
 #   docker run --gpus all -p 8000:8000 \
 #     -v /path/to/ckpt:/workspace/ckpt \
-#     -e GLM_TTS_API_KEY=your-key \
+#     -v /path/to/authorized_keys.json:/workspace/authorized_keys.json:ro \
 #     glm-tts-server:latest
 
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime

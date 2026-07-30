@@ -8,8 +8,7 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 
 - OpenAI-style `/v1/audio/speech` TTS endpoint
 - Separate `/v1/voices` CRUD endpoints for managing reference voices
-- Public-key JWT authentication with pre-enrolled keys (server stores only public keys)
-- Legacy single-secret Bearer authentication for local testing
+- Public-key JWT authentication with pre-enrolled keys (server stores only public keys; accepts OpenSSH `ssh-keygen` keys directly)
 - Environment-variable configuration with sensible defaults
 - Optional mock-inference mode for testing the API plumbing without model weights
 - Bundled `jerry` sample voice
@@ -21,7 +20,6 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GLM_TTS_AUTH_KEYS_FILE` | `/workspace/authorized_keys.json` (or `authorized_keys.json`) | Path to a JSON file of authorized public keys. If present, JWT auth is required. |
-| `GLM_TTS_API_KEY` | *(unset)* | Legacy single shared secret. Used only when `GLM_TTS_AUTH_KEYS_FILE` is not configured. |
 | `GLM_TTS_MODEL_DIR` | `/workspace/ckpt` (fallback `ckpt`) | Directory containing the GLM-TTS checkpoints. |
 | `GLM_TTS_VOICES_DIR` | `/workspace/voices` (fallback `voices`) | Directory where uploaded voices are stored. |
 | `GLM_TTS_DEVICE` | `auto` | `auto`, `cpu`, or `cuda`. |
@@ -34,9 +32,7 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 
 ## Authentication
 
-The server supports two authentication modes. They are **mutually exclusive**: if a public-key file is configured, JWT auth is used; otherwise the legacy API key is used. If neither is configured, the server is public.
-
-### Public-key JWT auth (recommended)
+The server uses **public-key JWT authentication** with pre-enrolled keys. If no keys file is configured, the server is public.
 
 The server stores only **public keys** in a JSON file. Clients sign short-lived JWTs with their own private keys and send them in the `Authorization` header.
 
@@ -46,16 +42,18 @@ The server stores only **public keys** in a JSON file. Clients sign short-lived 
 {
   "keys": [
     {
-      "kid": "tenant-a",
-      "name": "Tenant A",
-      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----",
+      "kid": "my-laptop",
+      "name": "My laptop",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host",
       "scopes": ["speech:generate", "voices:read", "voices:manage"]
     }
   ]
 }
 ```
 
-Supported key algorithms: RSA (`RS256`/`RS384`/`RS512`), ECDSA (`ES256`/`ES384`/`ES512`), Ed25519 (`EdDSA`).
+Public keys may be single-line **OpenSSH format** (`ssh-ed25519 ...`, `ssh-rsa ...`, trailing comments allowed — paste your `.pub` line as-is) or **PEM** (`-----BEGIN PUBLIC KEY-----`). See `authorized_keys.example.json`.
+
+Supported JWT algorithms: RSA (`RS256`/`RS384`/`RS512`), ECDSA (`ES256`/`ES384`/`ES512`), Ed25519 (`EdDSA`).
 
 The JWT must include:
 
@@ -76,52 +74,23 @@ Available scopes:
 
 ### Generating a key pair
 
+No special tooling needed — `ssh-keygen` is enough:
+
 ```bash
-openssl genrsa -out private.pem 2048
-openssl rsa -in private.pem -pubout -out public.pem
+ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"
 ```
 
-Then add the contents of `public.pem` (newlines preserved) to `authorized_keys.json`.
+Then paste the contents of `glm-tts-key.pub` (the whole line, comment included) as the `public_key` of an entry in `authorized_keys.json`. You can also reuse an existing SSH key (`~/.ssh/id_ed25519.pub`), though a dedicated key is tidier. PEM keys generated with `openssl` work too.
 
 ### Signing a JWT
 
-```bash
-python - <<'PY'
-import jwt
-from datetime import datetime, timezone, timedelta
-
-with open("private.pem", "r") as f:
-    private_key = f.read()
-
-now = datetime.now(timezone.utc)
-token = jwt.encode(
-    {
-        "sub": "tenant-a",
-        "iat": now,
-        "exp": now + timedelta(hours=1),
-        "scopes": ["speech:generate"],
-    },
-    private_key,
-    algorithm="RS256",
-    headers={"kid": "tenant-a"},
-)
-print(token)
-PY
-```
-
-### Legacy single-secret auth
-
-For local testing or simple deployments, you can still use:
+Use the bundled helper (installs nothing beyond the server's own `PyJWT` + `cryptography` deps):
 
 ```bash
-GLM_TTS_API_KEY=your-secret-key python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
+python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-laptop
 ```
 
-Clients send:
-
-```http
-Authorization: Bearer your-secret-key
-```
+It prints a token good for one hour (see `--expires`, `--scopes`, `--sub` for options). The algorithm is inferred from the key type (Ed25519 → `EdDSA`, RSA → `RS256`, EC → `ES256`); encrypted keys prompt for a passphrase.
 
 ---
 
@@ -147,7 +116,7 @@ pip install -r api/requirements.txt
 
 ```bash
 mkdir -p ckpt
-huggingface-cli download zai-org/GLM-TTS --local-dir ckpt --local-dir-use-symlinks False
+huggingface-cli download zai-org/GLM-TTS --local-dir ckpt
 ```
 
 ### 4. Run the server
@@ -178,6 +147,8 @@ docker build -t glm-tts-server:latest .
 
 ### 2. Push to a registry
 
+CI already does this: every push to `main` publishes `ghcr.io/<owner>/<repo>:latest` (see the `push-image` job in `.github/workflows/ci.yml`). To push manually instead:
+
 ```bash
 docker tag glm-tts-server:latest your-registry/glm-tts-server:latest
 docker push your-registry/glm-tts-server:latest
@@ -187,23 +158,56 @@ docker push your-registry/glm-tts-server:latest
 
 1. In the RunPod console, click **Pods** → **Deploy**.
 2. Choose a GPU with at least 16 GB VRAM (e.g., RTX 4090 / A5000 / A100).
-3. Under **Container Image**, enter your image URL (e.g., `your-registry/glm-tts-server:latest`).
+3. Under **Container Image**, enter your image URL (e.g., `ghcr.io/<owner>/<repo>:latest`).
 4. Set **Container Port** to `8000` and expose it as **HTTP** (or **TCP** if you prefer).
 5. Attach a **Network Volume** and mount it at `/workspace`.
    - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt` if it is empty.
-   - Uploaded voices will be persisted in `/workspace/voices`.
-6. Mount or generate an `authorized_keys.json` file at `/workspace/authorized_keys.json`. The server will load it on startup.
-7. (Optional) set other environment variables such as:
+   - The bundled `jerry` sample voice is copied into `/workspace/voices` on first boot; uploaded voices are persisted there too.
+6. (Optional) set other environment variables such as:
    - `GLM_TTS_DTYPE` (default `float16`)
    - `GLM_TTS_DEVICE` (default `auto`)
    - `GLM_TTS_PORT` (default `8000`)
 
-### 4. Verify the pod is ready
+### 4. Enroll your public key
 
-```bash
-curl https://<runpod-endpoint>/health
-curl https://<runpod-endpoint>/ready
-```
+The server loads authorized public keys at startup. It checks `/workspace/authorized_keys.json` first (network volume), then falls back to `authorized_keys.json` in the image (`/app`). Since only **public** keys are involved, committing the file to the repo is safe and is the zero-maintenance option:
+
+**Option A — bake it into the image (recommended).** Generate a key locally (`ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"`), create `authorized_keys.json` in the repo root (see [Authentication](#authentication) and `authorized_keys.example.json`), and commit it. The file is copied into the image at `/app/authorized_keys.json` and loaded from the very first boot — the server is never public, and there is nothing to configure per deploy.
+
+**Option B — place it on the network volume.** Useful for rotating keys without rebuilding the image. Open the pod's **web terminal** (or SSH in) and write the file, e.g.:
+   ```bash
+   cat > /workspace/authorized_keys.json <<'EOF'
+   { "keys": [ { "kid": "my-laptop", "public_key": "ssh-ed25519 AAAA... glm-tts", "scopes": ["speech:generate", "voices:read", "voices:manage"] } ] }
+   EOF
+   ```
+Then **restart the pod** (the model is cached on the volume, so the restart is quick). A file at `/workspace/authorized_keys.json` takes precedence over the baked-in one.
+
+> If neither file exists, the server is **public** — enroll via one of the options above before exposing the port.
+
+### 5. Verify the pod (first-deploy smoke test)
+
+Run through this checklist once after deploying:
+
+1. **Model download** — pod logs show `[runpod-start] Model download complete.` (first boot only; several GB, may take a while).
+2. **Health/readiness:**
+   ```bash
+   curl https://<runpod-endpoint>/health
+   curl https://<runpod-endpoint>/ready   # {"ready": true} once models are loaded
+   ```
+3. **Auth is enforced** — without a token you get 401:
+   ```bash
+   curl -i https://<runpod-endpoint>/v1/models   # HTTP/1.1 401
+   ```
+4. **Real synthesis** with the bundled voice:
+   ```bash
+   TOKEN=$(python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-laptop)
+   curl -X POST https://<runpod-endpoint>/v1/audio/speech \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"glm-tts","input":"你好，这是GLM-TTS的测试。","voice":"jerry","response_format":"wav"}' \
+     --output smoke_test.wav
+   ```
+   Play `smoke_test.wav` — if it speaks, the pod is fully operational.
 
 ---
 
@@ -280,23 +284,11 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.mp3
 ```
 
-### Legacy API key request
-
-If `GLM_TTS_API_KEY` is set instead of a public-key file:
-
-```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
-  -H "Authorization: Bearer your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"glm-tts","input":"Hello","voice":"my_voice","response_format":"wav"}' \
-  --output output.wav
-```
-
 ---
 
 ## Using the Jerry Sample Voice
 
-The fork includes a default sample voice at `voices/jerry/`. The server scans the voices directory on startup and automatically registers it.
+The fork includes a default sample voice at `voices/jerry/`. Locally, the server scans the voices directory on startup and automatically registers it. On RunPod, the startup script copies the bundled voices into `/workspace/voices` on first boot (only if that directory is empty), so the voice persists on your network volume alongside any voices you upload later via `POST /v1/voices`.
 
 ### Generate with the sample voice
 
