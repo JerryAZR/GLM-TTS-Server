@@ -160,8 +160,9 @@ docker push your-registry/glm-tts-server:latest
 2. Choose a GPU with at least 16 GB VRAM (e.g., RTX 4090 / A5000 / A100).
 3. Under **Container Image**, enter your image URL (e.g., `ghcr.io/<owner>/<repo>:latest`).
 4. Set **Container Port** to `8000` and expose it as **HTTP** (or **TCP** if you prefer).
-5. Attach a **Network Volume** and mount it at `/workspace`.
-   - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt` if it is empty.
+5. Attach a **Network Volume** of **at least 30 GB** and mount it at `/workspace`.
+   - The default 5 GB container disk is **too small**: the model download is multi-GB, and without a volume neither checkpoints nor voices persist across pod stops.
+   - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt` (a `.download-complete` marker protects against reusing a partial download — if a download dies, the next boot wipes and retries).
    - The bundled `jerry` sample voice is copied into `/workspace/voices` on first boot; uploaded voices are persisted there too.
 6. (Optional) set other environment variables such as:
    - `GLM_TTS_DTYPE` (default `float16`)

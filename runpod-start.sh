@@ -12,20 +12,32 @@ echo "[runpod-start] MODEL_DIR=${MODEL_DIR}"
 echo "[runpod-start] HF_REPO=${HF_REPO}"
 echo "[runpod-start] PORT=${PORT}"
 
-# If the model directory is missing or empty, try to download weights from HuggingFace.
-# Skipped in mock-inference mode, which never loads weights (keeps CI and local
-# mock runs from pulling multi-GB checkpoints).
+# If the model directory is missing or incomplete, download weights from
+# HuggingFace. Skipped in mock-inference mode, which never loads weights
+# (keeps CI and local mock runs from pulling multi-GB checkpoints).
+#
+# A .download-complete marker guards against reusing a partial download:
+# without it, a crashed/killed first download (e.g. disk full) would leave a
+# non-empty but broken directory that every later boot would "reuse".
+MARKER="${MODEL_DIR}/.download-complete"
+
 if [ "${GLM_TTS_MOCK_INFERENCE:-0}" = "1" ]; then
     echo "[runpod-start] Mock inference mode; skipping model download."
-elif [ ! -d "${MODEL_DIR}" ] || [ -z "$(ls -A "${MODEL_DIR}" 2>/dev/null)" ]; then
-    echo "[runpod-start] Model directory is empty. Downloading from ${HF_REPO} ..."
+elif [ -f "${MARKER}" ]; then
+    echo "[runpod-start] Reusing existing model directory (download marked complete)."
+else
+    if [ -d "${MODEL_DIR}" ] && [ -n "$(ls -A "${MODEL_DIR}" 2>/dev/null)" ]; then
+        echo "[runpod-start] WARNING: ${MODEL_DIR} is non-empty but has no .download-complete"
+        echo "[runpod-start] marker (previous download incomplete?). Wiping and re-downloading."
+        rm -rf "${MODEL_DIR:?}"
+    fi
+    echo "[runpod-start] Downloading model from ${HF_REPO} ..."
     mkdir -p "${MODEL_DIR}"
     # Note: --local-dir-use-symlinks was removed in huggingface_hub >= 0.26;
     # --local-dir now always writes real files, so no flag is needed.
     huggingface-cli download "${HF_REPO}" --local-dir "${MODEL_DIR}"
+    touch "${MARKER}"
     echo "[runpod-start] Model download complete."
-else
-    echo "[runpod-start] Reusing existing model directory."
 fi
 
 # Ensure the voices directory exists and seed it with bundled voices if empty.
