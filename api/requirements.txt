@@ -39,6 +39,7 @@ ruamel.yaml==0.18.17  # HyperPyYAML leaves this unpinned; 0.19+ breaks it ('Load
 PyYAML==6.0.3
 peft==0.7.0
 einops==0.8.1
+x_transformers==1.42.26  # rotary embeddings in flow/dit.py, flow/modules.py
 
 # API server
 fastapi==0.115.6
