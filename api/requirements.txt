@@ -35,6 +35,7 @@ pronouncing==0.2.0  # unconditional import in cosyvoice/utils/frontend_utils.py
 
 # Model config / utility
 HyperPyYAML==1.2.2
+ruamel.yaml==0.18.17  # HyperPyYAML leaves this unpinned; 0.19+ breaks it ('Loader' object has no attribute 'max_depth')
 PyYAML==6.0.3
 peft==0.7.0
 einops==0.8.1
