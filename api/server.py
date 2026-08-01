@@ -149,13 +149,15 @@ class InferenceEngine:
         self.startup_error: Optional[str] = None
 
     def configure(self, device_str: str, dtype_str: str) -> None:
-        os.environ["GLM_TTS_DEVICE"] = device_str
-        os.environ["GLM_TTS_DTYPE"] = dtype_str
-        self.device = get_device_from_env()
+        self.device = get_device_from_env(device_str)
         # fp16 / bf16 are not supported for CPU inference
-        if self.device.type == "cpu" and dtype_str.lower() in ("float16", "fp16", "bfloat16", "bf16"):
+        if self.device.type == "cpu" and dtype_str.lower() in ("float16", "fp16", "half", "bfloat16", "bf16"):
             logger.warning(f"Device is CPU; forcing float32 instead of {dtype_str}")
             dtype_str = "float32"
+        # Keep env in sync (after any override above) for code that reads it
+        # via get_*_from_env(); get_dtype_from_env prefers the env value.
+        os.environ["GLM_TTS_DEVICE"] = device_str
+        os.environ["GLM_TTS_DTYPE"] = dtype_str
         self.dtype = get_dtype_from_env(dtype_str)
         logger.info(f"Inference engine configured: device={self.device}, dtype={self.dtype}")
 

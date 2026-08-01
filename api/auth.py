@@ -71,8 +71,10 @@ def load_authorized_keys(path: str) -> None:
         with open(key_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
-        logger.error(f"Failed to load authorized keys from {path}: {exc}")
-        return
+        # Fail closed: a malformed keys file must not leave the server public.
+        raise RuntimeError(
+            f"Authorized keys file {path} exists but could not be parsed: {exc}"
+        ) from exc
 
     for entry in data.get("keys", []):
         kid = entry.get("kid")

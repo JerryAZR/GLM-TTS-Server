@@ -23,10 +23,13 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 | `GLM_TTS_MODEL_DIR` | `/workspace/ckpt` (fallback `ckpt`) | Directory containing the GLM-TTS checkpoints. |
 | `GLM_TTS_VOICES_DIR` | `/workspace/voices` (fallback `voices`) | Directory where uploaded voices are stored. |
 | `GLM_TTS_DEVICE` | `auto` | `auto`, `cpu`, or `cuda`. |
-| `GLM_TTS_DTYPE` | `float16` | `float16`, `bfloat16`, or `float32`. |
-| `GLM_TTS_PORT` | `8000` | HTTP port for the API. |
+| `GLM_TTS_DTYPE` | `float16` | `float16`, `bfloat16`, or `float32`. Forced to `float32` when the device is CPU. |
+| `GLM_TTS_PORT` | `8000` | HTTP port for the API. Changing this requires matching changes to the Docker `EXPOSE`/`HEALTHCHECK` and the exposed RunPod port (all default to 8000). |
 | `GLM_TTS_MOCK_INFERENCE` | `0` | Set to `1` to return a dummy WAV without loading models. |
 | `GLM_TTS_SAMPLE_RATE` | `24000` | Output sample rate (24 kHz or 32 kHz). |
+| `GLM_TTS_USE_PHONEME` | `0` | Set to `1` to enable phoneme input in the text frontend. |
+| `GLM_TTS_MAX_UPLOAD_BYTES` | `20000000` | Max reference-audio upload size in bytes (larger uploads are rejected with 413). |
+| `GLM_TTS_HF_REPO` | `zai-org/GLM-TTS` | HuggingFace repo the startup script downloads checkpoints from. |
 
 ---
 
@@ -60,7 +63,7 @@ The JWT must include:
 - `kid` in the header (matching an entry in the file)
 - `sub` claim
 - `exp` claim
-- `scopes` claim (array of strings)
+- `scopes` claim (array of strings) — required for scoped endpoints; a token without it can only call `/v1/models`
 
 Available scopes:
 
@@ -99,6 +102,7 @@ It prints a token good for one hour (see `--expires`, `--scopes`, `--sub` for op
 ### 1. Clone the fork
 
 ```bash
+git clone https://github.com/JerryAZR/GLM-TTS-Server.git
 cd GLM-TTS-Server
 ```
 
@@ -121,13 +125,15 @@ huggingface-cli download zai-org/GLM-TTS --local-dir ckpt
 
 ### 4. Run the server
 
-Mock mode (no weights or auth):
+Mock mode (no weights). Note this repo ships an `authorized_keys.json`, so JWT auth is still active; to run fully open, point `GLM_TTS_AUTH_KEYS_FILE` at a nonexistent path:
 
 ```bash
-GLM_TTS_MOCK_INFERENCE=1 python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
+GLM_TTS_MOCK_INFERENCE=1 \
+GLM_TTS_AUTH_KEYS_FILE=/nonexistent \
+python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-Mock mode with JWT auth:
+Mock mode with JWT auth (uses the repo's `authorized_keys.json` by default):
 
 ```bash
 GLM_TTS_MOCK_INFERENCE=1 \
@@ -161,11 +167,12 @@ docker push your-registry/glm-tts-server:latest
 1. In the RunPod console, click **Pods** → **Deploy**.
 2. Choose a GPU with at least 16 GB VRAM (e.g., RTX 4090 / A5000 / A100).
 3. Under **Container Image**, enter your image URL (e.g., `ghcr.io/<owner>/<repo>:latest`).
+   - GHCR packages pushed by CI are **private by default**: either flip the package to public (GitHub → Packages → `glm-tts-server` → Package settings → Change visibility), or add your GHCR credentials under **Registry Credentials** in the pod template. Pulling fails silently otherwise.
 4. Set **Container Port** to `8000` and expose it as **HTTP** (or **TCP** if you prefer).
 5. Attach a **Network Volume** of **at least 30 GB** and mount it at `/workspace`.
    - The default 5 GB container disk is **too small**: the model download is multi-GB, and without a volume neither checkpoints nor voices persist across pod stops.
-   - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt` (a `.download-complete` marker protects against reusing a partial download — if a download dies, the next boot wipes and retries).
-   - The bundled `jerry` sample voice is copied into `/workspace/voices` on first boot; uploaded voices are persisted there too.
+   - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt`. Completeness is validated on every boot (`.download-complete` marker, falling back to checking the actual model files): a partial download is wiped and retried, while a complete checkpoint copied in by other means is adopted as-is.
+   - The bundled `jerry` sample voice is copied into `/workspace/voices` on first boot if that directory is empty; uploaded voices are persisted there too.
 6. (Optional) set other environment variables such as:
    - `GLM_TTS_DTYPE` (default `float16`)
    - `GLM_TTS_DEVICE` (default `auto`)
@@ -176,6 +183,8 @@ docker push your-registry/glm-tts-server:latest
 The server loads authorized public keys at startup. It checks `/workspace/authorized_keys.json` first (network volume), then falls back to `authorized_keys.json` in the image (`/app`). Since only **public** keys are involved, committing the file to the repo is safe and is the zero-maintenance option:
 
 **Option A — bake it into the image (recommended).** Generate a key locally (`ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"`), create `authorized_keys.json` in the repo root (see [Authentication](#authentication) and `authorized_keys.example.json`), and commit it. The file is copied into the image at `/app/authorized_keys.json` and loaded from the very first boot — the server is never public, and there is nothing to configure per deploy.
+   - Only your **public** key ships in the image. Anyone can pull and run the image, but only the holder of the matching private key can authenticate — including to their own deployment, so keep the private key safe.
+   - The server **fails to start** if a keys file exists but cannot be parsed (fail-closed); it is only public when no keys file exists at all.
 
 **Option B — place it on the network volume.** Useful for rotating keys without rebuilding the image. Open the pod's **web terminal** (or SSH in) and write the file, e.g.:
    ```bash
@@ -195,19 +204,19 @@ Run through this checklist once after deploying:
 2. **Health/readiness:**
    ```bash
    curl https://<runpod-endpoint>/health
-   curl https://<runpod-endpoint>/ready   # {"ready": true} once models are loaded
+   curl https://<runpod-endpoint>/ready   # {"ready": true, "mock": false} once models are loaded
    ```
 3. **Auth is enforced** — without a token you get 401:
    ```bash
    curl -i https://<runpod-endpoint>/v1/models   # HTTP/1.1 401
    ```
-4. **Real synthesis** with the bundled voice:
+4. **Real synthesis** with the bundled voice (send the request from a real client or git-bash `curl` with UTF-8 handled — see the gotcha note above; on Windows, prefer Python):
    ```bash
    TOKEN=$(python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-laptop)
    curl -X POST https://<runpod-endpoint>/v1/audio/speech \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"model":"glm-tts","input":"你好，这是GLM-TTS的测试。","voice":"jerry","response_format":"wav"}' \
+     -d '{"model":"glm-tts","input":"Hello, this is a GLM-TTS smoke test.","voice":"jerry","response_format":"wav"}' \
      --output smoke_test.wav
    ```
    Play `smoke_test.wav` — if it speaks, the pod is fully operational.
@@ -318,7 +327,7 @@ curl -H "Authorization: Bearer $JWT_TOKEN" http://localhost:8000/v1/voices/jerry
 
 ## Docker Run Locally
 
-With mock inference and no auth:
+With mock inference (JWT auth still active via the baked-in `authorized_keys.json`; add `-e GLM_TTS_AUTH_KEYS_FILE=/nonexistent` to run open):
 
 ```bash
 docker run -p 8000:8000 -e GLM_TTS_MOCK_INFERENCE=1 glm-tts-server:latest
@@ -333,6 +342,8 @@ docker run --gpus all -p 8000:8000 \
   -v $(pwd)/authorized_keys.json:/workspace/authorized_keys.json:ro \
   glm-tts-server:latest
 ```
+
+A manually downloaded `ckpt` (see step 3 above) has no `.download-complete` marker — that's fine: the startup script validates the checkpoint's contents and adopts it, and only wipes directories that look genuinely incomplete.
 
 ---
 

@@ -37,19 +37,21 @@ def _load_private_key(path: str):
         # KEY-----"), so they must be detected before generic PEM.
         loader = serialization.load_ssh_private_key
     password = None
-    for _attempt in range(3):
+    prompts = 0
+    while True:
         try:
             return loader(data, password=password)
         except TypeError:
             # Encrypted key but no passphrase given yet.
-            password = getpass.getpass(f"Passphrase for {path}: ").encode() or None
+            pass
         except ValueError:
-            if password is not None:
-                # Most likely a wrong passphrase; retry.
-                password = None
-                continue
-            raise SystemExit(f"error: cannot parse private key from {path}")
-    raise SystemExit(f"error: cannot decrypt {path} (too many attempts)")
+            if password is None:
+                raise SystemExit(f"error: cannot parse private key from {path}")
+            # Most likely a wrong passphrase; fall through to re-prompt.
+        prompts += 1
+        if prompts > 3:
+            raise SystemExit(f"error: cannot decrypt {path} (too many attempts)")
+        password = getpass.getpass(f"Passphrase for {path}: ").encode() or None
 
 
 def _algorithm_for(key) -> str:

@@ -58,7 +58,7 @@ jobs:
             glm-tts-server:test
           # Wait for the non-blocking startup to finish.
           for i in {1..30}; do
-            if curl -fs http://localhost:8000/ready | grep -q '"ready": true'; then
+            if curl -fs http://localhost:8000/ready | grep -q '"ready":true'; then
               break
             fi
             sleep 1

@@ -166,6 +166,15 @@ def test_load_authorized_keys_openssh_ed25519(tmp_path):
     assert payload["sub"] == "test-user"
 
 
+def test_load_authorized_keys_malformed_file_fails_closed(tmp_path):
+    """A malformed keys file must raise (fail closed), not leave the server public."""
+    path = tmp_path / "authorized_keys.json"
+    path.write_text("{ this is not json")
+    with pytest.raises(RuntimeError, match="could not be parsed"):
+        load_authorized_keys(str(path))
+    assert not AUTHORIZED_KEYS
+
+
 def test_load_authorized_keys_skips_bad_entries(tmp_path):
     """Entries with unparseable keys are skipped, not fatal."""
     path = tmp_path / "authorized_keys.json"

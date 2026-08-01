@@ -19,16 +19,32 @@ echo "[runpod-start] PORT=${PORT}"
 # A .download-complete marker guards against reusing a partial download:
 # without it, a crashed/killed first download (e.g. disk full) would leave a
 # non-empty but broken directory that every later boot would "reuse".
+# Checkpoints populated outside this script (copied from another pod, manual
+# huggingface-cli download) have no marker, so completeness is validated by
+# content instead of wiping blindly.
 MARKER="${MODEL_DIR}/.download-complete"
+
+ckpt_complete() {
+    [ -f "${MARKER}" ] && return 0
+    [ -f "${MODEL_DIR}/flow/flow.pt" ] || return 1
+    [ -f "${MODEL_DIR}/flow/config.yaml" ] || return 1
+    compgen -G "${MODEL_DIR}/speech_tokenizer/model*.safetensors" > /dev/null || return 1
+    [ -n "$(ls -A "${MODEL_DIR}/llm" 2>/dev/null)" ] || return 1
+    return 0
+}
 
 if [ "${GLM_TTS_MOCK_INFERENCE:-0}" = "1" ]; then
     echo "[runpod-start] Mock inference mode; skipping model download."
-elif [ -f "${MARKER}" ]; then
-    echo "[runpod-start] Reusing existing model directory (download marked complete)."
+elif ckpt_complete; then
+    if [ ! -f "${MARKER}" ]; then
+        echo "[runpod-start] Found a complete checkpoint without marker; adopting it."
+        touch "${MARKER}"
+    fi
+    echo "[runpod-start] Reusing existing model directory."
 else
     if [ -d "${MODEL_DIR}" ] && [ -n "$(ls -A "${MODEL_DIR}" 2>/dev/null)" ]; then
-        echo "[runpod-start] WARNING: ${MODEL_DIR} is non-empty but has no .download-complete"
-        echo "[runpod-start] marker (previous download incomplete?). Wiping and re-downloading."
+        echo "[runpod-start] WARNING: ${MODEL_DIR} exists but looks incomplete"
+        echo "[runpod-start] (interrupted download?). Wiping and re-downloading."
         rm -rf "${MODEL_DIR:?}"
     fi
     echo "[runpod-start] Downloading model from ${HF_REPO} ..."
