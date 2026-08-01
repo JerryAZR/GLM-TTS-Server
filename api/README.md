@@ -139,6 +139,8 @@ python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
 
 ## RunPod Deployment
 
+> **Client gotcha:** RunPod's HTTP proxy sits behind Cloudflare bot protection. Non-browser clients whose default `User-Agent` is blocked (e.g. Python `urllib`/`requests`) get `403 error code: 1010`. Set any browser-like `User-Agent` header in your client and requests pass normally. `curl` is not affected. Also note `curl -d` on Windows mangles non-ASCII (e.g. Chinese) text — send UTF-8 JSON from a real client instead.
+
 ### 1. Build the Docker image
 
 ```bash
