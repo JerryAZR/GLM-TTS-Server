@@ -32,6 +32,32 @@ def test_list_voices(client):
     assert "voices" in resp.json()
 
 
+def test_version(client):
+    resp = client.get("/version")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "version" in body
+    assert body["mock"] is True
+
+
+def test_status(client):
+    resp = client.get("/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ready"] is True
+    assert body["mock"] is True
+    assert body["sample_rate"] == 24000
+    assert body["voices"] >= 1
+    assert body["generating"] is False
+    assert body["uptime_seconds"] >= 0
+    assert set(body["stats"]) == {
+        "speech_requests",
+        "failed_requests",
+        "audio_seconds_generated",
+        "last_generation_seconds",
+    }
+
+
 def test_create_speech_mock(client):
     resp = client.post(
         "/v1/audio/speech",
@@ -45,3 +71,9 @@ def test_create_speech_mock(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "audio/wav"
     assert len(resp.content) > 0
+
+    # Stats are updated after a successful generation.
+    stats = client.get("/status").json()["stats"]
+    assert stats["speech_requests"] >= 1
+    assert stats["audio_seconds_generated"] > 0
+    assert stats["last_generation_seconds"] is not None

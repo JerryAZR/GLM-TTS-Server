@@ -63,6 +63,19 @@ MOCK_INFERENCE = os.environ.get("GLM_TTS_MOCK_INFERENCE", "0") in ("1", "true", 
 USE_PHONEME = os.environ.get("GLM_TTS_USE_PHONEME", "0") in ("1", "true", "True")
 SAMPLE_RATE = int(os.environ.get("GLM_TTS_SAMPLE_RATE", "24000"))
 
+# Image build stamp (CI passes --build-arg GIT_SHA=...; "unknown" otherwise).
+GIT_SHA = os.environ.get("GLM_TTS_GIT_SHA", "unknown")
+STARTED_AT = time.time()
+
+# Lightweight request stats (in-memory; reset on restart). A "quick check"
+# for the /status endpoint — anything heavier belongs in an SSH session.
+STATS = {
+    "speech_requests": 0,
+    "failed_requests": 0,
+    "audio_seconds_generated": 0.0,
+    "last_generation_seconds": None,
+}
+
 # Max uploaded reference audio size (20 MB)
 MAX_UPLOAD_BYTES = int(os.environ.get("GLM_TTS_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
@@ -316,6 +329,32 @@ def ready():
     return payload
 
 
+@app.get("/version")
+def version():
+    """Public build stamp: which image revision is running."""
+    return {"version": GIT_SHA, "mock": MOCK_INFERENCE}
+
+
+@app.get("/status")
+def server_status(_=Depends(verify_auth())):
+    """Quick operational check: config, uptime, and request stats."""
+    payload = {
+        "version": GIT_SHA,
+        "ready": ENGINE.ready,
+        "mock": MOCK_INFERENCE,
+        "device": str(ENGINE.device) if ENGINE.device is not None else DEVICE_STR,
+        "dtype": str(ENGINE.dtype).replace("torch.", "") if ENGINE.dtype is not None else DTYPE_STR,
+        "sample_rate": SAMPLE_RATE,
+        "uptime_seconds": round(time.time() - STARTED_AT, 1),
+        "voices": len(VOICE_REGISTRY),
+        "generating": ENGINE.lock.locked(),
+        "stats": dict(STATS),
+    }
+    if not ENGINE.ready and ENGINE.startup_error:
+        payload["startup_error"] = ENGINE.startup_error
+    return payload
+
+
 @app.get("/v1/models")
 def list_models(_=Depends(verify_auth())):
     return {"data": [{"id": "glm-tts", "object": "model", "owned_by": "zai-org"}]}
@@ -346,8 +385,18 @@ async def create_speech(req: SpeechRequest, _=Depends(verify_auth(["speech:gener
     if req.voice not in VOICE_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Voice '{req.voice}' not found")
 
+    STATS["speech_requests"] += 1
     async with ENGINE.lock:
-        wav = await asyncio.to_thread(ENGINE.synthesize, req.input, req.voice)
+        t0 = time.monotonic()
+        try:
+            wav = await asyncio.to_thread(ENGINE.synthesize, req.input, req.voice)
+        except Exception:
+            STATS["failed_requests"] += 1
+            raise
+        STATS["last_generation_seconds"] = round(time.monotonic() - t0, 2)
+        STATS["audio_seconds_generated"] = round(
+            STATS["audio_seconds_generated"] + wav.shape[-1] / SAMPLE_RATE, 2
+        )
         wav_bytes = _tensor_to_wav_bytes(wav, SAMPLE_RATE)
 
     if req.response_format == "mp3":

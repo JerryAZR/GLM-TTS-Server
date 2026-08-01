@@ -30,6 +30,10 @@ COPY . /app
 # Install the slimmed inference + API requirements.
 RUN pip install --no-cache-dir -r api/requirements.txt
 
+# Build stamp for the /version and /status endpoints (CI passes the commit).
+ARG GIT_SHA=unknown
+ENV GLM_TTS_GIT_SHA=$GIT_SHA
+
 # Default environment variables (can be overridden at runtime).
 ENV GLM_TTS_MODEL_DIR=/workspace/ckpt
 ENV GLM_TTS_VOICES_DIR=/workspace/voices

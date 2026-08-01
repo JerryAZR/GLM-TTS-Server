@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t glm-tts-server:test .
+        run: docker build --build-arg GIT_SHA="${GITHUB_SHA::7}" -t glm-tts-server:test .
 
       - name: Run mock container and verify endpoints
         run: |
@@ -98,6 +98,6 @@ jobs:
 
       - name: Build and push
         run: |
-          docker build -t "${IMAGE_NAME}:latest" -t "${IMAGE_NAME}:sha-${GITHUB_SHA::7}" .
+          docker build --build-arg GIT_SHA="${GITHUB_SHA::7}" -t "${IMAGE_NAME}:latest" -t "${IMAGE_NAME}:sha-${GITHUB_SHA::7}" .
           docker push "${IMAGE_NAME}:latest"
           docker push "${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
