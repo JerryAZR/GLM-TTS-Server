@@ -349,6 +349,20 @@ The resolved value is visible in `GET /status` as `"default_voice"` (`null` when
 
 ---
 
+## Pronunciation Hints (Not Supported)
+
+The server has **no pronunciation-hint mechanism** — no SSML, no phoneme tags (the OpenAI speech API it mirrors doesn't have one either). The model guesses pronunciations from context, and it will guess wrong for:
+
+- **Polyphonic characters (多音字)** — e.g. `行` may be read *háng* or *xíng* depending on context
+- **Made-up tech words and acronyms** — e.g. "GLM-TTS", "NPC" may be "pronounced" as garbage words
+- **Numbers, symbols, mixed-language text** — reading varies by model
+
+**Sanitize the input client-side before sending:** replace ambiguous characters with unambiguous homophones (`这一行(hang2)代码` → `这一航代码`), respell made-up words phonetically, and spell out or drop acronyms. This preprocessing works universally across any TTS backend and keeps full control at the authoring site, where the intended reading is known. The smoke test's own default texts follow this rule (acronym-free by design).
+
+> Under the hood, GLM-TTS does have a pinyin-phoneme pathway that could support exact inline hints (e.g. `行(hang2)`) in the future, but the server does not expose it. Open an issue if a client-side sanitizer proves insufficient.
+
+---
+
 ## Notes
 
 - The model is kept loaded in GPU memory and only one generation runs at a time (`asyncio.Lock`) to avoid GPU contention.
