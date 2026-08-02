@@ -139,6 +139,7 @@ def test_resolve_dangling_configured_default_is_loud(registry):
 
 
 def test_resolve_named_default_beats_sole_voice(registry):
+    registry.clear()
     registry.update({"a": _fake_voice("a")})
     assert _pick_default(registry) == "a"  # sole voice
     registry["default"] = _fake_voice("default")
