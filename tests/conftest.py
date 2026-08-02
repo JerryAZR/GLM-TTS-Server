@@ -5,12 +5,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+# Set at conftest import time — NOT inside the fixture. Test modules import
+# api.server (and therefore api.auth) at collection time, and api.auth
+# captures GLM_TTS_AUTH_KEYS_FILE at import; setting it here guarantees the
+# test server never picks up the repo's real authorized_keys.json.
 os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
+os.environ["GLM_TTS_AUTH_KEYS_FILE"] = "/nonexistent/authorized_keys.json"
 
 
 def _load_server():
-    os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
-    os.environ["GLM_TTS_AUTH_KEYS_FILE"] = "/nonexistent/authorized_keys.json"
     import api.server as server
     importlib.reload(server)
     return server
