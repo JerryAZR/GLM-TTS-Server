@@ -45,7 +45,7 @@ def report(ok: bool, label: str, detail: str = "") -> bool:
     global _failures
     if not ok:
         _failures += 1
-    suffix = f" — {detail}" if detail else ""
+    suffix = f" - {detail}" if detail else ""
     print(f"[{'ok' if ok else 'FAIL'}] {label}{suffix}")
     return ok
 
@@ -161,7 +161,7 @@ def main() -> int:
     if _failures:
         print(f"SMOKE TEST FAILED ({_failures} check(s) failed)")
         return 1
-    print(f"SMOKE TEST PASSED — play {args.output} to hear the result")
+    print(f"SMOKE TEST PASSED - play {args.output} to hear the result")
     return 0
 
 
