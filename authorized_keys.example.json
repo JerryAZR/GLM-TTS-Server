@@ -1,16 +1,12 @@
 {
   "keys": [
     {
-      "kid": "my-laptop",
-      "name": "My laptop (ssh-keygen -t ed25519)",
       "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host",
-      "scopes": ["speech:generate", "voices:read", "voices:manage"]
+      "role": "admin"
     },
     {
-      "kid": "tenant-a",
-      "name": "PEM keys (e.g. openssl) also work",
-      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyJxP7ZqS2b...\n-----END PUBLIC KEY-----",
-      "scopes": ["speech:generate"]
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... friend@phone",
+      "role": "user"
     }
   ]
 }

@@ -11,16 +11,23 @@ format ("ssh-ed25519 AAAA...", "ssh-rsa AAAA...", ...), so the file works
 much like SSH's own authorized_keys: generate a key with ssh-keygen and
 paste the .pub line.
 
+Tokens carry no key ID: the server tries each enrolled key until the
+signature verifies (signature verification is microseconds; enrolled key
+counts are small). Each enrolled key has a role ("user" or "admin") that
+governs which endpoints it may call; the token itself only proves
+possession of the private key.
+
 If no keys are configured, all /v1 endpoints are public. A keys file that
 exists but cannot be parsed aborts startup (fail closed).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -40,6 +47,9 @@ JWT_ALGORITHMS: List[str] = [
     "EdDSA",
 ]
 
+# Role hierarchy: an entry may call endpoints requiring its level or lower.
+ROLE_LEVELS = {"user": 1, "admin": 2}
+
 security = HTTPBearer(auto_error=False)
 
 
@@ -47,7 +57,7 @@ class AuthState:
     """Authorized public keys for one app instance (app.state.auth)."""
 
     def __init__(self) -> None:
-        self.keys: Dict[str, Dict[str, Any]] = {}
+        self.keys: List[Dict[str, Any]] = []
 
 
 def _load_public_key(key_text: str):
@@ -56,6 +66,21 @@ def _load_public_key(key_text: str):
     if data.startswith((b"ssh-", b"ecdsa-")):
         return serialization.load_ssh_public_key(data)
     return serialization.load_pem_public_key(data)
+
+
+def _key_label(key_text: str, key_obj) -> str:
+    """Human-readable identity for logs: the OpenSSH comment if present
+    (e.g. 'user@host' from ssh-keygen -C), else a short key fingerprint."""
+    parts = key_text.strip().split()
+    if parts and parts[0].startswith(("ssh-", "ecdsa-")) and len(parts) >= 3:
+        return parts[2]
+    digest = hashlib.sha256(
+        key_obj.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).hexdigest()
+    return f"sha256:{digest[:12]}"
 
 
 def load_authorized_keys(state: AuthState, path: str) -> None:
@@ -78,31 +103,34 @@ def load_authorized_keys(state: AuthState, path: str) -> None:
         ) from exc
 
     for entry in data.get("keys", []):
-        kid = entry.get("kid")
         public_key = entry.get("public_key")
-        if not kid or not public_key:
-            logger.warning(
-                f"Skipping authorized-key entry missing 'kid' or 'public_key': {entry}"
-            )
+        if not public_key:
+            logger.warning(f"Skipping authorized-key entry missing 'public_key': {entry}")
+            continue
+        role = entry.get("role", "user")
+        if role not in ROLE_LEVELS:
+            logger.warning(f"Skipping authorized-key entry with unknown role '{role}'")
             continue
         try:
             key_obj = _load_public_key(public_key)
         except Exception as exc:
-            logger.warning(f"Skipping authorized-key entry '{kid}' (bad key): {exc}")
+            logger.warning(f"Skipping authorized-key entry (bad key): {exc}")
             continue
-        state.keys[kid] = {
-            "public_key": key_obj,
-            "scopes": set(entry.get("scopes", [])),
-            "name": entry.get("name", ""),
-        }
+        state.keys.append(
+            {
+                "public_key": key_obj,
+                "role": role,
+                "label": _key_label(public_key, key_obj),
+            }
+        )
 
     logger.info(f"Loaded {len(state.keys)} authorized public key(s) from {path}")
 
 
 def _verify_jwt(
-    token: str, keys: Dict[str, Dict[str, Any]], required_scopes: List[str]
+    token: str, keys: List[Dict[str, Any]], required_role: str
 ) -> Dict[str, Any]:
-    """Verify a JWT signed with a pre-enrolled private key."""
+    """Verify a JWT against the enrolled keys (try-all) and check its role."""
     if not token.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -111,58 +139,64 @@ def _verify_jwt(
     jwt_token = token[7:]
 
     try:
-        header = jwt.get_unverified_header(jwt_token)
+        jwt.get_unverified_header(jwt_token)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid authorization token: {exc}",
         )
 
-    kid = header.get("kid")
-    if not kid or kid not in keys:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unknown or missing key ID",
-        )
-
-    key_entry = keys[kid]
-    try:
-        payload = jwt.decode(
-            jwt_token,
-            key=key_entry["public_key"],
-            algorithms=JWT_ALGORITHMS,
-            options={"require": ["exp", "sub"]},
-        )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired",
-        )
-    except jwt.InvalidTokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {exc}",
-        )
-
-    token_scopes: Set[str] = set(payload.get("scopes", []))
-    for scope in required_scopes:
-        if scope not in token_scopes:
+    payload = None
+    matched = None
+    for entry in keys:
+        try:
+            payload = jwt.decode(
+                jwt_token,
+                key=entry["public_key"],
+                algorithms=JWT_ALGORITHMS,
+                options={"require": ["exp", "sub"]},
+            )
+            matched = entry
+            break
+        except jwt.ExpiredSignatureError:
+            # Signature verified but the token expired — no other key will help.
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Missing required scope: {scope}",
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token expired",
+            )
+        except jwt.InvalidSignatureError:
+            continue  # Not signed by this key; try the next one.
+        except jwt.InvalidTokenError as exc:
+            # Signature verified but claims are invalid — definitive.
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid token: {exc}",
             )
 
+    if payload is None or matched is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token signature",
+        )
+
+    logger.debug(f"Authenticated key '{matched['label']}' (role={matched['role']})")
+    if ROLE_LEVELS[matched["role"]] < ROLE_LEVELS[required_role]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This endpoint requires the '{required_role}' role",
+        )
     return payload
 
 
-def verify_auth(required_scopes: Optional[List[str]] = None):
+def verify_auth(required_role: str = "user"):
     """
     FastAPI dependency factory.
     Reads the app's AuthState (app.state.auth): if public keys are
-    configured, require a signed JWT; otherwise the endpoint is public.
-    Returns the JWT payload (or an empty dict when no auth is configured).
+    configured, require a JWT signed by an enrolled key whose role is at
+    least required_role; otherwise the endpoint is public.
     """
-    required_scopes = required_scopes or []
+    if required_role not in ROLE_LEVELS:
+        raise ValueError(f"Unknown required_role: {required_role}")
 
     async def _verify(
         request: Request,
@@ -183,6 +217,6 @@ def verify_auth(required_scopes: Optional[List[str]] = None):
 
         if not token.startswith("Bearer "):
             token = f"Bearer {token}"
-        return _verify_jwt(token, keys, required_scopes)
+        return _verify_jwt(token, keys, required_role)
 
     return _verify

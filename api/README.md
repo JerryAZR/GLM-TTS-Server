@@ -38,7 +38,7 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 
 The server uses **public-key JWT authentication** with pre-enrolled keys. If no keys file is configured, the server is public.
 
-The server stores only **public keys** in a JSON file. Clients sign short-lived JWTs with their own private keys and send them in the `Authorization` header.
+The server stores only **public keys** in a JSON file — much like SSH's own `authorized_keys`. Clients sign short-lived JWTs with their private keys; the token only proves possession of a key. What that key may do is decided server-side by its enrolled **role**.
 
 `authorized_keys.json` format:
 
@@ -46,35 +46,29 @@ The server stores only **public keys** in a JSON file. Clients sign short-lived 
 {
   "keys": [
     {
-      "kid": "my-laptop",
-      "name": "My laptop",
       "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host",
-      "scopes": ["speech:generate", "voices:read", "voices:manage"]
+      "role": "admin"
+    },
+    {
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... friend@phone",
+      "role": "user"
     }
   ]
 }
 ```
 
-Public keys may be single-line **OpenSSH format** (`ssh-ed25519 ...`, `ssh-rsa ...`, trailing comments allowed — paste your `.pub` line as-is) or **PEM** (`-----BEGIN PUBLIC KEY-----`). See `authorized_keys.example.json`.
+That's the whole format — a public key (OpenSSH one-line, comment included, or PEM) plus a role. `role` defaults to `"user"` when omitted.
 
-Supported JWT algorithms: RSA (`RS256`/`RS384`/`RS512`), ECDSA (`ES256`/`ES384`/`ES512`), Ed25519 (`EdDSA`).
+Roles:
 
-The JWT must include:
-
-- `kid` in the header (matching an entry in the file)
-- `sub` claim
-- `exp` claim
-- `scopes` claim (array of strings) — required for scoped endpoints; a token without it can only call `/v1/models`
-
-Available scopes:
-
-| Scope | Endpoint |
+| Role | Can do |
 |---|---|
-| `speech:generate` | `POST /v1/audio/speech` |
-| `voices:read` | `GET /v1/voices`, `GET /v1/voices/{id}` |
-| `voices:manage` | `POST /v1/voices`, `DELETE /v1/voices/{id}` |
+| `user` | `POST /v1/audio/speech`, `GET /v1/voices`, `GET /v1/models`, `GET /status` |
+| `admin` | everything `user` can, plus `POST` and `DELETE /v1/voices` |
 
-`/v1/models` and `/status` require a valid token but no specific scope. `/health`, `/ready`, and `/version` are always public.
+Tokens carry no key ID: the server tries each enrolled key until the signature verifies (verification is microseconds; key counts are small). The JWT itself needs only `sub` and `exp` claims. Supported algorithms: RSA (`RS256`/`RS384`/`RS512`), ECDSA (`ES256`/`ES384`/`ES512`), Ed25519 (`EdDSA`).
+
+`/health`, `/ready`, and `/version` are always public.
 
 ### Generating a key pair
 
@@ -84,17 +78,17 @@ No special tooling needed — `ssh-keygen` is enough:
 ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"
 ```
 
-Then paste the contents of `glm-tts-key.pub` (the whole line, comment included) as the `public_key` of an entry in `authorized_keys.json`. You can also reuse an existing SSH key (`~/.ssh/id_ed25519.pub`), though a dedicated key is tidier. PEM keys generated with `openssl` work too.
+Then paste the contents of `glm-tts-key.pub` (the whole line, comment included) as the `public_key` of an entry in `authorized_keys.json`. The comment doubles as the identity shown in server logs when the key authenticates. You can also reuse an existing SSH key (`~/.ssh/id_ed25519.pub`), though a dedicated key is tidier. PEM keys generated with `openssl` work too.
 
 ### Signing a JWT
 
-Use the bundled helper (installs nothing beyond the server's own `PyJWT` + `cryptography` deps):
+Use the bundled helper (installs nothing beyond `PyJWT` + `cryptography`):
 
 ```bash
-python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-laptop
+python scripts/make_token.py --key ~/.ssh/glm-tts-key
 ```
 
-It prints a token good for one hour (see `--expires`, `--scopes`, `--sub` for options). The algorithm is inferred from the key type (Ed25519 → `EdDSA`, RSA → `RS256`, EC → `ES256`); encrypted keys prompt for a passphrase.
+It prints a token good for one hour (see `--expires`, `--sub` for options). The algorithm is inferred from the key type (Ed25519 → `EdDSA`, RSA → `RS256`, EC → `ES256`); encrypted keys prompt for a passphrase.
 
 ---
 
@@ -190,37 +184,22 @@ The server loads authorized public keys at startup. It checks `/workspace/author
 **Option B — place it on the network volume.** Useful for rotating keys without rebuilding the image. Open the pod's **web terminal** (or SSH in) and write the file, e.g.:
    ```bash
    cat > /workspace/authorized_keys.json <<'EOF'
-   { "keys": [ { "kid": "my-laptop", "public_key": "ssh-ed25519 AAAA... glm-tts", "scopes": ["speech:generate", "voices:read", "voices:manage"] } ] }
+   { "keys": [ { "public_key": "ssh-ed25519 AAAA... glm-tts", "role": "admin" } ] }
    EOF
    ```
 Then **restart the pod** (the model is cached on the volume, so the restart is quick). A file at `/workspace/authorized_keys.json` takes precedence over the baked-in one.
 
 > If neither file exists, the server is **public** — enroll via one of the options above before exposing the port.
 
-### 5. Verify the pod (first-deploy smoke test)
+### 5. Verify the pod (smoke test)
 
-Run through this checklist once after deploying:
+One command checks the whole deployment — liveness, build revision, model readiness, auth enforcement, status, and a real synthesis saved to `smoke_test.wav`:
 
-1. **Model download** — pod logs show `[runpod-start] Model download complete.` (first boot only; several GB, may take a while).
-2. **Health/readiness:**
-   ```bash
-   curl https://<runpod-endpoint>/health
-   curl https://<runpod-endpoint>/ready   # {"ready": true, "mock": false} once models are loaded
-   ```
-3. **Auth is enforced** — without a token you get 401:
-   ```bash
-   curl -i https://<runpod-endpoint>/v1/models   # HTTP/1.1 401
-   ```
-4. **Real synthesis** with the bundled voice (send the request from a real client or git-bash `curl` with UTF-8 handled — see the gotcha note above; on Windows, prefer Python):
-   ```bash
-   TOKEN=$(python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-laptop)
-   curl -X POST https://<runpod-endpoint>/v1/audio/speech \
-     -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"model":"glm-tts","input":"Hello, this is a GLM-TTS smoke test.","voice":"jerry","response_format":"wav"}' \
-     --output smoke_test.wav
-   ```
-   Play `smoke_test.wav` — if it speaks, the pod is fully operational.
+```bash
+python scripts/smoke_test.py --endpoint https://<runpod-endpoint> --key ~/.ssh/glm-tts-key
+```
+
+It prints `[ok]`/`[FAIL]` per check and exits non-zero on failure. Omit `--key` for a public server; see `--text`, `--voice`, `--output`, `--timeout` for options (first boot needs patience: the model download is several GB, and `--timeout` defaults to 300s of `/ready` polling). If it ends with `SMOKE TEST PASSED`, play `smoke_test.wav` — the pod is fully operational.
 
 ---
 

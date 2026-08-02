@@ -45,10 +45,10 @@ jobs:
           ssh-keygen -t ed25519 -f ci-key -N "" -q
           mkdir -p ci-workspace
           cat > ci-workspace/authorized_keys.json <<EOF
-          { "keys": [ { "kid": "ci", "public_key": "$(cat ci-key.pub)", "scopes": ["speech:generate", "voices:read", "voices:manage"] } ] }
+          { "keys": [ { "public_key": "$(cat ci-key.pub)", "role": "admin" } ] }
           EOF
           pip install --quiet PyJWT cryptography
-          TOKEN=$(python scripts/make_token.py --key ci-key --kid ci --expires 600)
+          TOKEN=$(python scripts/make_token.py --key ci-key --expires 600)
 
           docker run -d --rm \
             -p 8000:8000 \

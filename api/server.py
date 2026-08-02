@@ -431,7 +431,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/v1/audio/speech")
     async def create_speech(
-        req: SpeechRequest, _=Depends(verify_auth(["speech:generate"]))
+        req: SpeechRequest, _=Depends(verify_auth())
     ):
         if not engine.ready:
             raise HTTPException(
@@ -479,7 +479,7 @@ def create_app(settings: Settings) -> FastAPI:
         prompt_text: str = Form(...),
         prompt_audio: UploadFile = File(...),
         voice_id: Optional[str] = Form(None),
-        _=Depends(verify_auth(["voices:manage"])),
+        _=Depends(verify_auth("admin")),
     ):
         if not voice_id:
             voice_id = f"voice_{uuid.uuid4().hex[:12]}"
@@ -549,7 +549,7 @@ def create_app(settings: Settings) -> FastAPI:
             return {"voice_id": safe_id, "name": name, "created_at": created_at}
 
     @app.get("/v1/voices")
-    def list_voices(_=Depends(verify_auth(["voices:read"]))):
+    def list_voices(_=Depends(verify_auth())):
         return {
             "voices": [
                 {
@@ -562,7 +562,7 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     @app.get("/v1/voices/{voice_id}")
-    def get_voice(voice_id: str, _=Depends(verify_auth(["voices:read"]))):
+    def get_voice(voice_id: str, _=Depends(verify_auth())):
         if voice_id not in voices:
             raise HTTPException(status_code=404, detail="Voice not found")
         v = voices[voice_id]
@@ -574,7 +574,7 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     @app.delete("/v1/voices/{voice_id}")
-    async def delete_voice(voice_id: str, _=Depends(verify_auth(["voices:manage"]))):
+    async def delete_voice(voice_id: str, _=Depends(verify_auth("admin"))):
         async with voice_lock:
             if voice_id not in voices:
                 raise HTTPException(status_code=404, detail="Voice not found")

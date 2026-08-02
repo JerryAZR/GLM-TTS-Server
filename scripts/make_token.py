@@ -2,12 +2,13 @@
 """Mint a short-lived JWT for the GLM-TTS API.
 
 Loads an OpenSSH or PEM private key (e.g. one generated with
-``ssh-keygen -t ed25519 -f glm-tts-key``) and prints a signed JWT whose
-``kid`` matches an entry in the server's authorized_keys.json.
+``ssh-keygen -t ed25519 -f glm-tts-key``) and prints a signed token that
+proves possession of the key. Your privileges come from the key's enrolled
+role on the server, not from the token.
 
 Example:
-    python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-key
-    TOKEN=$(python scripts/make_token.py --key ~/.ssh/glm-tts-key --kid my-key)
+    python scripts/make_token.py --key ~/.ssh/id_ed25519
+    TOKEN=$(python scripts/make_token.py --key ~/.ssh/id_ed25519)
     curl -H "Authorization: Bearer $TOKEN" https://<pod>/v1/models
 """
 
@@ -20,8 +21,6 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
-
-DEFAULT_SCOPES = ["speech:generate", "voices:read", "voices:manage"]
 
 
 def _load_private_key(path: str):
@@ -36,6 +35,7 @@ def _load_private_key(path: str):
         # OpenSSH private keys are armored too ("-----BEGIN OPENSSH PRIVATE
         # KEY-----"), so they must be detected before generic PEM.
         loader = serialization.load_ssh_private_key
+
     password = None
     prompts = 0
     while True:
@@ -64,6 +64,21 @@ def _algorithm_for(key) -> str:
     raise SystemExit(f"error: unsupported key type: {type(key).__name__}")
 
 
+def make_token(key_path: str, sub: str = "glm-tts-user", expires: int = 3600) -> str:
+    """Sign a short-lived JWT with the private key at key_path."""
+    private_key = _load_private_key(key_path)
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "sub": sub,
+            "iat": now,
+            "exp": now + timedelta(seconds=expires),
+        },
+        private_key,
+        algorithm=_algorithm_for(private_key),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Mint a short-lived JWT for the GLM-TTS API.",
@@ -71,15 +86,7 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument("--key", required=True, help="Path to the private key (OpenSSH or PEM).")
-    parser.add_argument("--kid", required=True, help="Key ID matching an authorized_keys.json entry.")
     parser.add_argument("--sub", default="glm-tts-user", help="Subject claim (default: %(default)s).")
-    parser.add_argument(
-        "--scopes",
-        nargs="+",
-        default=DEFAULT_SCOPES,
-        metavar="SCOPE",
-        help="Scopes to grant (default: %(default)s).",
-    )
     parser.add_argument(
         "--expires",
         type=int,
@@ -88,23 +95,7 @@ def main() -> None:
         help="Token lifetime in seconds (default: %(default)s).",
     )
     args = parser.parse_args()
-
-    private_key = _load_private_key(args.key)
-    algorithm = _algorithm_for(private_key)
-
-    now = datetime.now(timezone.utc)
-    token = jwt.encode(
-        {
-            "sub": args.sub,
-            "iat": now,
-            "exp": now + timedelta(seconds=args.expires),
-            "scopes": args.scopes,
-        },
-        private_key,
-        algorithm=algorithm,
-        headers={"kid": args.kid},
-    )
-    print(token)
+    print(make_token(args.key, sub=args.sub, expires=args.expires))
 
 
 if __name__ == "__main__":
