@@ -7,6 +7,35 @@ on:
     branches: [main]
 
 jobs:
+  changes:
+    # Decide whether the Docker image is affected. Tests always run; the
+    # expensive image build/push only happens when image content changes.
+    # (tests/, docs, .github/ are already .dockerignore'd; scripts/ are
+    # client-side tools whose image copies are incidental.)
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            image:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'api/**'
+              - 'runpod-start.sh'
+              - 'glmtts_inference.py'
+              - 'cosyvoice/**'
+              - 'flow/**'
+              - 'llm/**'
+              - 'utils/**'
+              - 'configs/**'
+              - 'frontend/**'
+              - 'voices/**'
+              - 'authorized_keys.json'
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +59,8 @@ jobs:
         run: pytest tests/test_server_mock.py tests/test_auth.py -v
 
   docker:
+    needs: changes
+    if: needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
