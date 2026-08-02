@@ -35,6 +35,7 @@ jobs:
               - 'frontend/**'
               - 'voices/**'
               - 'authorized_keys.json'
+              - '!**/*.md'  # docs are .dockerignore'd; never image-relevant
 
   test:
     runs-on: ubuntu-latest
