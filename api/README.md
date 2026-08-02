@@ -199,7 +199,7 @@ One command checks the whole deployment — liveness, build revision, model read
 python scripts/smoke_test.py --endpoint https://<runpod-endpoint>
 ```
 
-It prints `[ok]`/`[FAIL]` per check and exits non-zero on failure. Your SSH key is auto-detected (`~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`; pass `--key` to use a different one) — and if the server is public, the token is simply ignored. See `--text`, `--voice`, `--output`, `--timeout` for options (first boot needs patience: the model download is several GB, and `--timeout` defaults to 300s of `/ready` polling). If it ends with `SMOKE TEST PASSED`, play `smoke_test.wav` — the pod is fully operational.
+It prints `[ok]`/`[FAIL]` per check and exits non-zero on failure. Your SSH key is auto-detected (`~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`; pass `--key` to use a different one) — and if the server is public, the token is simply ignored. By default it synthesizes two acronym-free samples, `smoke_test_en.wav` and `smoke_test_zh.wav` (`--lang en|zh|both`, or `--text` for a custom single sample; `--output` sets the file stem). English passing while Chinese fails points at a text encoding problem, not the model. First boot needs patience: the model download is several GB, and `--timeout` defaults to 300s of `/ready` polling. If it ends with `SMOKE TEST PASSED`, play the WAVs — the pod is fully operational.
 
 ---
 

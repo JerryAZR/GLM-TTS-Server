@@ -13,7 +13,10 @@ Checks (each printed as [ok]/[FAIL], non-zero exit on any failure):
   4. auth: with --key, a tokenless request is rejected (401) and a signed
      JWT is accepted; without --key, the server is expected to be public
   5. /status reports device, voices, and the resolved default voice
-  6. POST /v1/audio/speech returns a valid WAV (written to --output)
+  6. POST /v1/audio/speech returns valid WAVs (English and Chinese samples
+     by default; acronym/number-free texts so a healthy deployment never
+     sounds broken). English passing while Chinese fails points at a text
+     encoding problem, not the model.
 
 Only the Python standard library plus PyJWT/cryptography (already used by
 scripts/make_token.py) are required.
@@ -81,8 +84,12 @@ def main() -> int:
     parser.add_argument("--sub", default="smoke-test", help="Token subject (default: %(default)s).")
     parser.add_argument("--voice", default="",
                         help="Voice to synthesize with (default: omit, exercising default resolution).")
-    parser.add_argument("--text", default="Hello, this is a GLM-TTS deployment smoke test.",
-                        help="Text to synthesize.")
+    parser.add_argument("--text", default=None,
+                        help="Custom text to synthesize (single sample; overrides --lang).")
+    parser.add_argument("--lang", choices=["en", "zh", "both"], default="both",
+                        help="Sample language(s) for the default texts (default: both). "
+                             "If English works but Chinese fails, suspect a text "
+                             "encoding problem in transit rather than the model.")
     parser.add_argument("--output", default="smoke_test.wav", help="Output WAV path.")
     parser.add_argument("--timeout", type=int, default=300,
                         help="Seconds to wait for /ready (default: %(default)s; first boot "
@@ -148,30 +155,54 @@ def main() -> int:
     else:
         report(False, "GET /status", f"HTTP {code}")
 
-    # 6. Real synthesis.
-    body = {"model": "glm-tts", "input": args.text, "response_format": "wav"}
-    if args.voice:
-        body["voice"] = args.voice
-    code, data = http("POST", f"{ep}/v1/audio/speech", token=token, body=body, timeout=180)
-    if code != 200:
-        detail = data.decode(errors="replace")[:200]
-        report(False, "POST /v1/audio/speech", f"HTTP {code}: {detail}")
+    # 6. Real synthesis. Default: one English and one Chinese sample. The
+    # default texts avoid acronyms/numbers/symbols (TTS models mangle them,
+    # which would make a healthy deployment sound broken).
+    stem = args.output[:-4] if args.output.lower().endswith(".wav") else args.output
+    if args.text is not None:
+        samples = [("custom", args.text, args.output)]
     else:
+        texts = {
+            "en": "Hello, this is a smoke test of the text to speech server. "
+                  "If you can hear this message clearly, the deployment is working as expected.",
+            "zh": "你好，这是一段语音合成测试。如果你能清楚地听到这段话，说明服务运行正常。",
+        }
+        langs = ["en", "zh"] if args.lang == "both" else [args.lang]
+        samples = [(lang, texts[lang], f"{stem}_{lang}.wav") for lang in langs]
+
+    synth_results = {}
+    for lang, text, output in samples:
+        body = {"model": "glm-tts", "input": text, "response_format": "wav"}
+        if args.voice:
+            body["voice"] = args.voice
+        code, data = http("POST", f"{ep}/v1/audio/speech", token=token, body=body, timeout=180)
+        if code != 200:
+            detail = data.decode(errors="replace")[:200]
+            synth_results[lang] = report(False, f"synthesis ({lang})", f"HTTP {code}: {detail}")
+            continue
         try:
             w = wave.open(io.BytesIO(data))
             seconds = w.getnframes() / w.getframerate()
-            with open(args.output, "wb") as f:
+            with open(output, "wb") as f:
                 f.write(data)
-            report(seconds > 0.2, "POST /v1/audio/speech",
-                   f"{w.getnchannels()}ch {w.getframerate()}Hz {seconds:.1f}s -> {args.output}")
+            synth_results[lang] = report(
+                seconds > 0.2, f"synthesis ({lang})",
+                f"{w.getnchannels()}ch {w.getframerate()}Hz {seconds:.1f}s -> {output}")
         except Exception as e:
-            report(False, "POST /v1/audio/speech", f"response is not a valid WAV: {e}")
+            synth_results[lang] = report(False, f"synthesis ({lang})", f"not a valid WAV: {e}")
+
+    # Differential hint: English working while Chinese fails points at
+    # encoding problems (e.g. a mangling proxy/client), not the model.
+    if synth_results.get("en") and synth_results.get("zh") is False:
+        print("[hint] English succeeded but Chinese failed - likely a text "
+              "encoding problem between client and server, not a model issue.")
 
     print()
     if _failures:
         print(f"SMOKE TEST FAILED ({_failures} check(s) failed)")
         return 1
-    print(f"SMOKE TEST PASSED - play {args.output} to hear the result")
+    outputs = " and ".join(output for _, _, output in samples)
+    print(f"SMOKE TEST PASSED - play {outputs} to hear the result")
     return 0
 
 
