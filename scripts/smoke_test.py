@@ -32,7 +32,7 @@ import urllib.request
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from make_token import make_token  # noqa: E402
+from make_token import make_token, find_default_key  # noqa: E402
 
 # RunPod's proxy is behind Cloudflare bot protection: default library user
 # agents get "403 error code: 1010". A browser-shaped UA avoids that.
@@ -74,8 +74,10 @@ def main() -> int:
     )
     parser.add_argument("--endpoint", required=True,
                         help="Base URL, e.g. https://<pod>.proxy.runpod.net")
-    parser.add_argument("--key", default="",
-                        help="Private key for JWT auth (omit if the server is public).")
+    parser.add_argument("--key", default=None,
+                        help="Private key for JWT auth. Default: first of "
+                             "~/.ssh/id_ed25519, ~/.ssh/id_rsa. Sending a "
+                             "token to a public server is harmless.")
     parser.add_argument("--sub", default="smoke-test", help="Token subject (default: %(default)s).")
     parser.add_argument("--voice", default="",
                         help="Voice to synthesize with (default: omit, exercising default resolution).")
@@ -115,18 +117,26 @@ def main() -> int:
     if not report(ready, "GET /ready", "model loaded" if ready else f"not ready after {args.timeout}s: {last}"):
         return 1
 
-    # 4. Auth behavior.
+    # 4. Auth behavior. A token is minted whenever a key is available — on a
+    # public server it is simply ignored (verify_auth short-circuits), so
+    # both modes pass; the report just notes which one is live.
     token = ""
-    if args.key:
+    key_path = args.key or find_default_key()
+    if key_path:
         code, _ = http("GET", f"{ep}/v1/models")
-        report(code == 401, "auth enforced", f"tokenless /v1/models -> HTTP {code} (want 401)")
-        token = make_token(args.key, sub=args.sub)
+        if code == 401:
+            report(True, "auth enforced", "tokenless /v1/models -> HTTP 401")
+        elif code == 200:
+            report(True, "server is public", "token accepted but not required")
+        else:
+            report(False, "auth probe", f"tokenless /v1/models -> HTTP {code}")
+        token = make_token(key_path, sub=args.sub)
         code, _ = http("GET", f"{ep}/v1/models", token=token)
-        if not report(code == 200, "JWT accepted", f"HTTP {code}" if code != 200 else ""):
+        if not report(code == 200, "JWT accepted", f"key: {key_path}" + ("" if code == 200 else f", HTTP {code}")):
             return 1
     else:
         code, _ = http("GET", f"{ep}/v1/models")
-        report(code == 200, "server is public (no --key given)", f"HTTP {code}")
+        report(code == 200, "server is public (no key found)", f"HTTP {code}")
 
     # 5. Status overview.
     code, data = http("GET", f"{ep}/status", token=token)

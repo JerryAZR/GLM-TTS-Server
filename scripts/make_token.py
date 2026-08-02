@@ -16,11 +16,24 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 from datetime import datetime, timedelta, timezone
 
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+
+# Default private key locations, tried in order when --key is omitted.
+DEFAULT_KEY_PATHS = ("~/.ssh/id_ed25519", "~/.ssh/id_rsa")
+
+
+def find_default_key() -> "str | None":
+    """First existing default SSH private key, or None."""
+    for candidate in DEFAULT_KEY_PATHS:
+        path = os.path.expanduser(candidate)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def _load_private_key(path: str):
@@ -85,7 +98,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--key", required=True, help="Path to the private key (OpenSSH or PEM).")
+    parser.add_argument("--key", default=None,
+                        help="Path to the private key (OpenSSH or PEM). "
+                             "Default: first of ~/.ssh/id_ed25519, ~/.ssh/id_rsa.")
     parser.add_argument("--sub", default="glm-tts-user", help="Subject claim (default: %(default)s).")
     parser.add_argument(
         "--expires",
@@ -95,7 +110,14 @@ def main() -> None:
         help="Token lifetime in seconds (default: %(default)s).",
     )
     args = parser.parse_args()
-    print(make_token(args.key, sub=args.sub, expires=args.expires))
+
+    key_path = args.key or find_default_key()
+    if not key_path:
+        parser.error(
+            "no --key given and no default key found at "
+            + ", ".join(DEFAULT_KEY_PATHS)
+        )
+    print(make_token(key_path, sub=args.sub, expires=args.expires))
 
 
 if __name__ == "__main__":

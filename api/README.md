@@ -196,10 +196,10 @@ Then **restart the pod** (the model is cached on the volume, so the restart is q
 One command checks the whole deployment — liveness, build revision, model readiness, auth enforcement, status, and a real synthesis saved to `smoke_test.wav`:
 
 ```bash
-python scripts/smoke_test.py --endpoint https://<runpod-endpoint> --key ~/.ssh/glm-tts-key
+python scripts/smoke_test.py --endpoint https://<runpod-endpoint>
 ```
 
-It prints `[ok]`/`[FAIL]` per check and exits non-zero on failure. Omit `--key` for a public server; see `--text`, `--voice`, `--output`, `--timeout` for options (first boot needs patience: the model download is several GB, and `--timeout` defaults to 300s of `/ready` polling). If it ends with `SMOKE TEST PASSED`, play `smoke_test.wav` — the pod is fully operational.
+It prints `[ok]`/`[FAIL]` per check and exits non-zero on failure. Your SSH key is auto-detected (`~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`; pass `--key` to use a different one) — and if the server is public, the token is simply ignored. See `--text`, `--voice`, `--output`, `--timeout` for options (first boot needs patience: the model download is several GB, and `--timeout` defaults to 300s of `/ready` polling). If it ends with `SMOKE TEST PASSED`, play `smoke_test.wav` — the pod is fully operational.
 
 ---
 
