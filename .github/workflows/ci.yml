@@ -24,7 +24,8 @@ jobs:
             image:
               - 'Dockerfile'
               - '.dockerignore'
-              - 'api/**'
+              - 'api/*.py'
+              - 'api/requirements.txt'
               - 'runpod-start.sh'
               - 'glmtts_inference.py'
               - 'cosyvoice/**'
@@ -35,7 +36,6 @@ jobs:
               - 'frontend/**'
               - 'voices/**'
               - 'authorized_keys.json'
-              - '!**/*.md'  # docs are .dockerignore'd; never image-relevant
 
   test:
     runs-on: ubuntu-latest
