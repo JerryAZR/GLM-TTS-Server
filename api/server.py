@@ -63,6 +63,9 @@ MOCK_INFERENCE = os.environ.get("GLM_TTS_MOCK_INFERENCE", "0") in ("1", "true", 
 USE_PHONEME = os.environ.get("GLM_TTS_USE_PHONEME", "0") in ("1", "true", "True")
 SAMPLE_RATE = int(os.environ.get("GLM_TTS_SAMPLE_RATE", "24000"))
 
+# Optional operator-configured default voice (see resolve_voice()).
+DEFAULT_VOICE_STR = os.environ.get("GLM_TTS_DEFAULT_VOICE", "")
+
 # Image build stamp (CI passes --build-arg GIT_SHA=...; "unknown" otherwise).
 GIT_SHA = os.environ.get("GLM_TTS_GIT_SHA", "unknown")
 STARTED_AT = time.time()
@@ -95,6 +98,57 @@ class VoiceEntry(BaseModel):
     prompt_text: str
     created_at: str
     path: Path
+
+
+def _pick_default(voices: Dict[str, "VoiceEntry"], configured_default: str = "") -> Optional[str]:
+    """Best-effort default voice, never raises. Priority:
+    configured default > voice_id "default" > sole registered voice."""
+    if configured_default and configured_default in voices:
+        return configured_default
+    if "default" in voices:
+        return "default"
+    if len(voices) == 1:
+        return next(iter(voices))
+    return None
+
+
+def resolve_voice(
+    requested: Optional[str],
+    voices: Dict[str, "VoiceEntry"],
+    configured_default: str = "",
+) -> str:
+    """Resolve which voice a speech request uses. Called per request (the
+    registry is mutable via the voices API; resolution is trivial).
+
+    Priority: explicit request > configured default (GLM_TTS_DEFAULT_VOICE)
+    > voice_id "default" > sole registered voice. Failures are loud and
+    precise: a dangling configured default is an operator error, never a
+    silent fallthrough to a different voice.
+    """
+    if requested:
+        if requested not in voices:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{requested}' not found; available: {sorted(voices)}",
+            )
+        return requested
+    if configured_default and configured_default not in voices:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Configured default voice '{configured_default}' "
+                f"(GLM_TTS_DEFAULT_VOICE) not found; available: {sorted(voices)}"
+            ),
+        )
+    default = _pick_default(voices, configured_default)
+    if default is not None:
+        return default
+    if not voices:
+        raise HTTPException(status_code=404, detail="No voices available")
+    raise HTTPException(
+        status_code=400,
+        detail=f"Multiple voices available; specify 'voice': {sorted(voices)}",
+    )
 
 
 VOICE_REGISTRY: Dict[str, VoiceEntry] = {}
@@ -309,6 +363,13 @@ async def _load_engine() -> None:
 async def on_startup():
     load_authorized_keys(AUTH_KEYS_FILE)
     scan_voices()
+    if DEFAULT_VOICE_STR and DEFAULT_VOICE_STR not in VOICE_REGISTRY:
+        logger.warning(
+            f"GLM_TTS_DEFAULT_VOICE='{DEFAULT_VOICE_STR}' does not match any "
+            f"registered voice; speech requests without an explicit voice will fail"
+        )
+    else:
+        logger.info(f"Default voice: {_pick_default(VOICE_REGISTRY, DEFAULT_VOICE_STR)}")
     asyncio.create_task(_load_engine())
 
 
@@ -347,6 +408,7 @@ def server_status(_=Depends(verify_auth())):
         "sample_rate": SAMPLE_RATE,
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "voices": len(VOICE_REGISTRY),
+        "default_voice": _pick_default(VOICE_REGISTRY, DEFAULT_VOICE_STR),
         "generating": ENGINE.lock.locked(),
         "stats": dict(STATS),
     }
@@ -363,7 +425,7 @@ def list_models(_=Depends(verify_auth())):
 class SpeechRequest(BaseModel):
     model: str = "glm-tts"
     input: str = Field(..., min_length=1, max_length=5000)
-    voice: str
+    voice: Optional[str] = None  # resolved via resolve_voice() when omitted
     response_format: str = "wav"  # wav or mp3
     speed: float = 1.0
 
@@ -382,14 +444,13 @@ async def create_speech(req: SpeechRequest, _=Depends(verify_auth(["speech:gener
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="input text cannot be empty")
 
-    if req.voice not in VOICE_REGISTRY:
-        raise HTTPException(status_code=404, detail=f"Voice '{req.voice}' not found")
+    voice_id = resolve_voice(req.voice, VOICE_REGISTRY, DEFAULT_VOICE_STR)
 
     STATS["speech_requests"] += 1
     async with ENGINE.lock:
         t0 = time.monotonic()
         try:
-            wav = await asyncio.to_thread(ENGINE.synthesize, req.input, req.voice)
+            wav = await asyncio.to_thread(ENGINE.synthesize, req.input, voice_id)
         except Exception:
             STATS["failed_requests"] += 1
             raise

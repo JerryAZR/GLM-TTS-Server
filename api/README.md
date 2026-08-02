@@ -29,6 +29,7 @@ An OpenAI-compatible FastAPI server for [GLM-TTS](https://github.com/zai-org/GLM
 | `GLM_TTS_SAMPLE_RATE` | `24000` | Output sample rate (24 kHz or 32 kHz). |
 | `GLM_TTS_USE_PHONEME` | `0` | Set to `1` to enable phoneme input in the text frontend. |
 | `GLM_TTS_MAX_UPLOAD_BYTES` | `20000000` | Max reference-audio upload size in bytes (larger uploads are rejected with 413). |
+| `GLM_TTS_DEFAULT_VOICE` | *(unset)* | Voice used when a speech request omits `voice`. See [Default Voice Resolution](#default-voice-resolution). |
 | `GLM_TTS_HF_REPO` | `zai-org/GLM-TTS` | HuggingFace repo the startup script downloads checkpoints from. |
 
 ---
@@ -344,6 +345,20 @@ docker run --gpus all -p 8000:8000 \
 ```
 
 A manually downloaded `ckpt` (see step 3 above) has no `.download-complete` marker — that's fine: the startup script validates the checkpoint's contents and adopts it, and only wipes directories that look genuinely incomplete.
+
+---
+
+## Default Voice Resolution
+
+`voice` is optional in `POST /v1/audio/speech`. When omitted, the voice is resolved **per request** (the registry changes at runtime via the voices API) in this order:
+
+1. **`voice` in the request** — always wins; unknown name → `404`.
+2. **`GLM_TTS_DEFAULT_VOICE`** — operator override. If set but the voice doesn't exist, requests fail loudly with `400` naming the dangling config (never a silent fallback to a different voice); a startup warning is logged too.
+3. **A voice with `voice_id` = `"default"`** — convention over config. Manageable entirely through the voices API (upload/rename/delete), no redeploy needed.
+4. **Exactly one voice registered** — zero-config convenience.
+5. **Otherwise** — `400` listing the available voices.
+
+The resolved value is visible in `GET /status` as `"default_voice"` (`null` when ambiguous).
 
 ---
 

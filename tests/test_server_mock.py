@@ -48,6 +48,7 @@ def test_status(client):
     assert body["mock"] is True
     assert body["sample_rate"] == 24000
     assert body["voices"] >= 1
+    assert body["default_voice"] == "jerry"  # sole registered voice
     assert body["generating"] is False
     assert body["uptime_seconds"] >= 0
     assert set(body["stats"]) == {
@@ -77,3 +78,113 @@ def test_create_speech_mock(client):
     assert stats["speech_requests"] >= 1
     assert stats["audio_seconds_generated"] > 0
     assert stats["last_generation_seconds"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Default voice resolution
+# ---------------------------------------------------------------------------
+
+import api.server as server
+from api.server import VoiceEntry, _pick_default, resolve_voice
+from fastapi import HTTPException
+from pathlib import Path
+
+
+def _fake_voice(voice_id):
+    return VoiceEntry(
+        voice_id=voice_id, name=voice_id, prompt_text="t",
+        created_at="2026-01-01T00:00:00+00:00", path=Path("/nonexistent"),
+    )
+
+
+@pytest.fixture
+def registry():
+    """A scratch VOICE_REGISTRY restored after the test."""
+    saved = dict(server.VOICE_REGISTRY)
+    yield server.VOICE_REGISTRY
+    server.VOICE_REGISTRY.clear()
+    server.VOICE_REGISTRY.update(saved)
+
+
+def _speech(client, **kw):
+    payload = {"model": "glm-tts", "input": "hi", "response_format": "wav"}
+    payload.update(kw)
+    return client.post("/v1/audio/speech", json=payload)
+
+
+# --- pure-function tiers ---------------------------------------------------
+
+def test_resolve_explicit_wins(registry):
+    registry.update({"a": _fake_voice("a"), "default": _fake_voice("default")})
+    assert resolve_voice("a", registry, "default") == "a"
+
+
+def test_resolve_explicit_unknown_404(registry):
+    with pytest.raises(HTTPException) as e:
+        resolve_voice("nope", registry)
+    assert e.value.status_code == 404
+
+
+def test_resolve_configured_default(registry):
+    registry.update({"a": _fake_voice("a"), "b": _fake_voice("b")})
+    assert resolve_voice(None, registry, "b") == "b"
+
+
+def test_resolve_dangling_configured_default_is_loud(registry):
+    registry.update({"a": _fake_voice("a")})
+    with pytest.raises(HTTPException) as e:
+        resolve_voice(None, registry, "missing")
+    assert e.value.status_code == 400
+    assert "GLM_TTS_DEFAULT_VOICE" in e.value.detail
+
+
+def test_resolve_named_default_beats_sole_voice(registry):
+    registry.update({"a": _fake_voice("a")})
+    assert _pick_default(registry) == "a"  # sole voice
+    registry["default"] = _fake_voice("default")
+    assert _pick_default(registry) == "default"  # named default wins
+
+
+def test_resolve_multiple_without_default_fails(registry):
+    registry.update({"a": _fake_voice("a"), "b": _fake_voice("b")})
+    assert _pick_default(registry) is None
+    with pytest.raises(HTTPException) as e:
+        resolve_voice(None, registry)
+    assert e.value.status_code == 400
+    assert "a" in e.value.detail and "b" in e.value.detail
+
+
+def test_resolve_no_voices_404():
+    with pytest.raises(HTTPException) as e:
+        resolve_voice(None, {})
+    assert e.value.status_code == 404
+
+
+# --- through the HTTP endpoint --------------------------------------------
+
+def test_speech_omitted_voice_uses_sole_registered(client, registry):
+    registry.clear()
+    registry["jerry"] = _fake_voice("jerry")
+    assert _speech(client).status_code == 200
+
+
+def test_speech_omitted_voice_multiple_is_400(client, registry):
+    registry.clear()
+    registry.update({"jerry": _fake_voice("jerry"), "bob": _fake_voice("bob")})
+    resp = _speech(client)
+    assert resp.status_code == 400
+    assert "jerry" in resp.json()["detail"]
+
+
+def test_speech_omitted_voice_env_default(client, registry, monkeypatch):
+    registry.clear()
+    registry.update({"jerry": _fake_voice("jerry"), "bob": _fake_voice("bob")})
+    monkeypatch.setattr(server, "DEFAULT_VOICE_STR", "bob")
+    assert _speech(client).status_code == 200
+
+
+def test_speech_omitted_voice_dangling_env_default(client, registry, monkeypatch):
+    monkeypatch.setattr(server, "DEFAULT_VOICE_STR", "missing")
+    resp = _speech(client)
+    assert resp.status_code == 400
+    assert "missing" in resp.json()["detail"]
