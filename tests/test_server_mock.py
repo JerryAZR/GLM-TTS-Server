@@ -1,8 +1,6 @@
 # Mock-mode tests for the GLM-TTS FastAPI server.
-# These tests run without model weights or a GPU and assume public access.
-
-import os
-os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
+# These run against a dedicated mock-mode app from conftest (no weights, no
+# GPU, no auth keys -> public access).
 
 import pytest
 
@@ -84,10 +82,11 @@ def test_create_speech_mock(client):
 # Default voice resolution
 # ---------------------------------------------------------------------------
 
-import api.server as server
-from api.server import VoiceEntry, _pick_default, resolve_voice
-from fastapi import HTTPException
 from pathlib import Path
+
+from fastapi import HTTPException
+
+from api.server import VoiceEntry, _pick_default, resolve_voice
 
 
 def _fake_voice(voice_id):
@@ -98,12 +97,13 @@ def _fake_voice(voice_id):
 
 
 @pytest.fixture
-def registry():
-    """A scratch VOICE_REGISTRY restored after the test."""
-    saved = dict(server.VOICE_REGISTRY)
-    yield server.VOICE_REGISTRY
-    server.VOICE_REGISTRY.clear()
-    server.VOICE_REGISTRY.update(saved)
+def registry(app):
+    """A scratch voice registry on the test app, restored after each test."""
+    voices = app.state.voices
+    saved = dict(voices)
+    yield voices
+    voices.clear()
+    voices.update(saved)
 
 
 def _speech(client, **kw):
@@ -177,15 +177,15 @@ def test_speech_omitted_voice_multiple_is_400(client, registry):
     assert "jerry" in resp.json()["detail"]
 
 
-def test_speech_omitted_voice_env_default(client, registry, monkeypatch):
+def test_speech_omitted_voice_env_default(client, app, registry, monkeypatch):
     registry.clear()
     registry.update({"jerry": _fake_voice("jerry"), "bob": _fake_voice("bob")})
-    monkeypatch.setattr(server, "DEFAULT_VOICE_STR", "bob")
+    monkeypatch.setattr(app.state.settings, "default_voice", "bob")
     assert _speech(client).status_code == 200
 
 
-def test_speech_omitted_voice_dangling_env_default(client, registry, monkeypatch):
-    monkeypatch.setattr(server, "DEFAULT_VOICE_STR", "missing")
+def test_speech_omitted_voice_dangling_env_default(client, app, monkeypatch):
+    monkeypatch.setattr(app.state.settings, "default_voice", "missing")
     resp = _speech(client)
     assert resp.status_code == 400
     assert "missing" in resp.json()["detail"]

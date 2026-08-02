@@ -1,9 +1,7 @@
 # JWT public-key authentication tests.
 # These tests run in mock mode and use a generated RSA key pair.
 
-import importlib
 import json
-import os
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -12,9 +10,6 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
-
-
-os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
 
 
 def _generate_key_pair():
@@ -40,8 +35,7 @@ def key_pair():
 def auth_client(key_pair, tmp_path_factory):
     public_key, private_key = key_pair
     # Enroll the key through the real path: a keys file on disk that the
-    # server loads during startup (load_authorized_keys clears in-memory
-    # state, so enrolling directly before startup would be wiped).
+    # server loads during startup.
     keys_file = tmp_path_factory.mktemp("auth") / "authorized_keys.json"
     keys_file.write_text(
         json.dumps(
@@ -58,16 +52,12 @@ def auth_client(key_pair, tmp_path_factory):
         )
     )
 
-    os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
-    os.environ["GLM_TTS_AUTH_KEYS_FILE"] = str(keys_file)
+    from api.settings import Settings
+    from api.server import create_app
 
-    import api.auth as auth
-    import api.server as server
+    app = create_app(Settings(mock_inference=True, auth_keys_file=str(keys_file)))
 
-    importlib.reload(auth)  # re-read GLM_TTS_AUTH_KEYS_FILE
-    importlib.reload(server)  # re-import AUTH_KEYS_FILE from the reloaded auth
-
-    with TestClient(server.app) as c:
+    with TestClient(app) as c:
         deadline = time.time() + 10
         while time.time() < deadline:
             resp = c.get("/ready")

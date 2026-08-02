@@ -1,22 +1,10 @@
-import os
 import time
-import importlib
+
 import pytest
 from fastapi.testclient import TestClient
 
-
-# Set at conftest import time — NOT inside the fixture. Test modules import
-# api.server (and therefore api.auth) at collection time, and api.auth
-# captures GLM_TTS_AUTH_KEYS_FILE at import; setting it here guarantees the
-# test server never picks up the repo's real authorized_keys.json.
-os.environ["GLM_TTS_MOCK_INFERENCE"] = "1"
-os.environ["GLM_TTS_AUTH_KEYS_FILE"] = "/nonexistent/authorized_keys.json"
-
-
-def _load_server():
-    import api.server as server
-    importlib.reload(server)
-    return server
+# NOTE: api.server (and its torch dependency) is imported lazily inside the
+# fixtures so torch-free unit tests (test_auth_unit.py) stay lightweight.
 
 
 def _wait_for_ready(client, timeout=10.0):
@@ -30,12 +18,25 @@ def _wait_for_ready(client, timeout=10.0):
 
 
 @pytest.fixture(scope="module")
-def client():
-    server = _load_server()
-    with TestClient(server.app) as c:
+def app():
+    """A mock-mode app with no auth keys — all /v1 endpoints are public."""
+    from api.settings import Settings
+    from api.server import create_app
+
+    return create_app(
+        Settings(
+            mock_inference=True,
+            auth_keys_file="/nonexistent/authorized_keys.json",
+        )
+    )
+
+
+@pytest.fixture(scope="module")
+def client(app):
+    with TestClient(app) as c:
         _wait_for_ready(c)
         yield c
 
 
 # Re-export for test_server_mock.py to use a simpler import path
-__all__ = ["client"]
+__all__ = ["app", "client"]

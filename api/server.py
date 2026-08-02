@@ -1,15 +1,21 @@
 """
-FastAPI OpenAI-compatible TTS server for GLM-TTS.
+OpenAI-compatible FastAPI server for GLM-TTS (zero-shot voice cloning TTS).
 
 Endpoints:
-  - GET  /health
-  - GET  /ready
-  - GET  /v1/models
-  - POST /v1/audio/speech
-  - POST /v1/voices
-  - GET  /v1/voices
-  - GET  /v1/voices/{voice_id}
-  - DELETE /v1/voices/{voice_id}
+  GET  /health           - liveness (container healthcheck)
+  GET  /ready            - model load status
+  GET  /version          - image build stamp
+  GET  /status           - config, uptime, request stats (auth required)
+  GET  /v1/models        - model list (auth required)
+  POST /v1/audio/speech  - TTS generation (scope: speech:generate)
+  /v1/voices             - voice CRUD (scopes: voices:read / voices:manage)
+
+Configuration comes from api.settings.Settings (GLM_TTS_* env vars), read
+once when the app is created. All mutable state (auth keys, voice registry,
+inference engine, stats) lives on app.state, created per app instance in
+create_app(). The module-level `app` at the bottom is the uvicorn entry
+point; tests build their own instances with explicit Settings instead of
+mutating the environment.
 """
 
 from __future__ import annotations
@@ -22,74 +28,42 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import soundfile as sf
 import torch
-import torchaudio
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
-from api.auth import load_authorized_keys, verify_auth, AUTH_KEYS_FILE
-from glmtts_inference import generate_long, get_device_from_env, get_dtype_from_env, load_models
+from api.auth import AuthState, load_authorized_keys, verify_auth
+from api.settings import Settings
+from glmtts_inference import generate_long, load_models
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Environment configuration
-# ---------------------------------------------------------------------------
-
-MODEL_DIR = os.environ.get("GLM_TTS_MODEL_DIR", "")
-if not MODEL_DIR:
-    MODEL_DIR = "/workspace/ckpt" if Path("/workspace/ckpt").exists() else "ckpt"
-
-VOICES_DIR = os.environ.get("GLM_TTS_VOICES_DIR", "")
-if not VOICES_DIR:
-    VOICES_DIR = "/workspace/voices" if Path("/workspace/voices").exists() else "voices"
-
-DEVICE_STR = os.environ.get("GLM_TTS_DEVICE", "auto")
-DTYPE_STR = os.environ.get("GLM_TTS_DTYPE", "float16")
-PORT = int(os.environ.get("GLM_TTS_PORT", "8000"))
-MOCK_INFERENCE = os.environ.get("GLM_TTS_MOCK_INFERENCE", "0") in ("1", "true", "True")
-
-USE_PHONEME = os.environ.get("GLM_TTS_USE_PHONEME", "0") in ("1", "true", "True")
-SAMPLE_RATE = int(os.environ.get("GLM_TTS_SAMPLE_RATE", "24000"))
-
-# Optional operator-configured default voice (see resolve_voice()).
-DEFAULT_VOICE_STR = os.environ.get("GLM_TTS_DEFAULT_VOICE", "")
-
-# Image build stamp (CI passes --build-arg GIT_SHA=...; "unknown" otherwise).
-GIT_SHA = os.environ.get("GLM_TTS_GIT_SHA", "unknown")
-STARTED_AT = time.time()
-
-# Lightweight request stats (in-memory; reset on restart). A "quick check"
-# for the /status endpoint — anything heavier belongs in an SSH session.
-STATS = {
-    "speech_requests": 0,
-    "failed_requests": 0,
-    "audio_seconds_generated": 0.0,
-    "last_generation_seconds": None,
+_DTYPES = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
 }
+_HALF_DTYPES = ("float16", "fp16", "half", "bfloat16", "bf16")
 
-# Max uploaded reference audio size (20 MB)
-MAX_UPLOAD_BYTES = int(os.environ.get("GLM_TTS_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="GLM-TTS Server", version="0.1.0")
 
 # ---------------------------------------------------------------------------
-# Voice registry
+# Voice registry helpers
 # ---------------------------------------------------------------------------
 
 class VoiceEntry(BaseModel):
@@ -100,7 +74,7 @@ class VoiceEntry(BaseModel):
     path: Path
 
 
-def _pick_default(voices: Dict[str, "VoiceEntry"], configured_default: str = "") -> Optional[str]:
+def _pick_default(voices: Dict[str, VoiceEntry], configured_default: str = "") -> Optional[str]:
     """Best-effort default voice, never raises. Priority:
     configured default > voice_id "default" > sole registered voice."""
     if configured_default and configured_default in voices:
@@ -114,7 +88,7 @@ def _pick_default(voices: Dict[str, "VoiceEntry"], configured_default: str = "")
 
 def resolve_voice(
     requested: Optional[str],
-    voices: Dict[str, "VoiceEntry"],
+    voices: Dict[str, VoiceEntry],
     configured_default: str = "",
 ) -> str:
     """Resolve which voice a speech request uses. Called per request (the
@@ -151,10 +125,6 @@ def resolve_voice(
     )
 
 
-VOICE_REGISTRY: Dict[str, VoiceEntry] = {}
-VOICE_LOCK = asyncio.Lock()
-
-
 def _voice_meta_path(voice_path: Path) -> Path:
     return voice_path / "metadata.json"
 
@@ -184,18 +154,18 @@ def _load_voice_from_disk(voice_path: Path) -> Optional[VoiceEntry]:
     )
 
 
-def scan_voices() -> None:
+def scan_voices(voices_dir: str, voices: Dict[str, VoiceEntry]) -> None:
     """Scan the voices directory and populate the in-memory registry."""
-    VOICE_REGISTRY.clear()
-    voices_root = Path(VOICES_DIR)
+    voices.clear()
+    voices_root = Path(voices_dir)
     voices_root.mkdir(parents=True, exist_ok=True)
     for entry in voices_root.iterdir():
         if not entry.is_dir():
             continue
         voice = _load_voice_from_disk(entry)
         if voice:
-            VOICE_REGISTRY[voice.voice_id] = voice
-    logger.info(f"Loaded {len(VOICE_REGISTRY)} voice(s) from {voices_root}")
+            voices[voice.voice_id] = voice
+    logger.info(f"Loaded {len(voices)} voice(s) from {voices_root}")
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +173,10 @@ def scan_voices() -> None:
 # ---------------------------------------------------------------------------
 
 class InferenceEngine:
-    def __init__(self):
+    """Holds the loaded models and serializes generation with a lock."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
         self.device: Optional[torch.device] = None
         self.dtype: Optional[torch.dtype] = None
         self.frontend = None
@@ -215,27 +188,29 @@ class InferenceEngine:
         self.ready = False
         self.startup_error: Optional[str] = None
 
-    def configure(self, device_str: str, dtype_str: str) -> None:
-        self.device = get_device_from_env(device_str)
-        # fp16 / bf16 are not supported for CPU inference
-        if self.device.type == "cpu" and dtype_str.lower() in ("float16", "fp16", "half", "bfloat16", "bf16"):
-            logger.warning(f"Device is CPU; forcing float32 instead of {dtype_str}")
+    def configure(self) -> None:
+        device_str = self.settings.device
+        if device_str.lower() == "auto":
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device_str)
+
+        dtype_str = self.settings.dtype.lower()
+        if self.device.type == "cpu" and dtype_str in _HALF_DTYPES:
+            logger.warning(f"Device is CPU; forcing float32 instead of {self.settings.dtype}")
             dtype_str = "float32"
-        # Keep env in sync (after any override above) for code that reads it
-        # via get_*_from_env(); get_dtype_from_env prefers the env value.
-        os.environ["GLM_TTS_DEVICE"] = device_str
-        os.environ["GLM_TTS_DTYPE"] = dtype_str
-        self.dtype = get_dtype_from_env(dtype_str)
+        self.dtype = _DTYPES.get(dtype_str)
+        if self.dtype is None:
+            raise ValueError(f"Unknown dtype: {self.settings.dtype}")
         logger.info(f"Inference engine configured: device={self.device}, dtype={self.dtype}")
 
     def load(self) -> None:
-        if MOCK_INFERENCE:
+        if self.settings.mock_inference:
             logger.info("Mock inference enabled; skipping model load.")
             self.ready = True
             return
 
-        self.configure(DEVICE_STR, DTYPE_STR)
-        logger.info(f"Loading models from {MODEL_DIR} ...")
+        self.configure()
+        logger.info(f"Loading models from {self.settings.model_dir} ...")
         (
             self.frontend,
             self.text_frontend,
@@ -243,11 +218,11 @@ class InferenceEngine:
             self.llm,
             self.flow,
         ) = load_models(
-            use_phoneme=USE_PHONEME,
-            sample_rate=SAMPLE_RATE,
+            use_phoneme=self.settings.use_phoneme,
+            sample_rate=self.settings.sample_rate,
             device=self.device,
             dtype=self.dtype,
-            model_dir=MODEL_DIR,
+            model_dir=self.settings.model_dir,
         )
         self.ready = True
         logger.info("Models loaded successfully.")
@@ -257,7 +232,9 @@ class InferenceEngine:
         prompt_text = self.text_frontend.text_normalize(voice.prompt_text)
         prompt_text_token = self.frontend._extract_text_token(prompt_text + " ")
         prompt_speech_token = self.frontend._extract_speech_token([str(audio_path)])
-        speech_feat = self.frontend._extract_speech_feat(str(audio_path), sample_rate=SAMPLE_RATE)
+        speech_feat = self.frontend._extract_speech_feat(
+            str(audio_path), sample_rate=self.settings.sample_rate
+        )
         embedding = self.frontend._extract_spk_embedding(str(audio_path))
 
         # Keep audio features in fp32; only the LLM is cast to the configured dtype.
@@ -269,20 +246,17 @@ class InferenceEngine:
 
         return prompt_text, prompt_text_token, cache_speech_token, flow_prompt_token, speech_feat, embedding
 
-    def synthesize(self, text: str, voice_id: str) -> torch.Tensor:
-        if MOCK_INFERENCE:
+    def synthesize(self, text: str, voice: VoiceEntry) -> torch.Tensor:
+        if self.settings.mock_inference:
             # 1 second of silence-ish dummy sine wave at the target sample rate
-            t = torch.linspace(0, 1, SAMPLE_RATE, dtype=torch.float32)
-            wav = torch.sin(2 * 3.1415926 * 440 * t).unsqueeze(0)
-            return wav
+            t = torch.linspace(0, 1, self.settings.sample_rate, dtype=torch.float32)
+            return torch.sin(2 * 3.1415926 * 440 * t).unsqueeze(0)
 
-        if voice_id not in VOICE_REGISTRY:
-            raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
-
-        voice = VOICE_REGISTRY[voice_id]
         audio_path = voice.path / "prompt_audio.wav"
         if not audio_path.exists():
-            raise HTTPException(status_code=404, detail=f"Voice audio for '{voice_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Voice audio for '{voice.voice_id}' not found"
+            )
 
         (
             prompt_text,
@@ -305,18 +279,15 @@ class InferenceEngine:
             text_frontend=self.text_frontend,
             llm=self.llm,
             flow=self.flow,
-            text_info=[voice_id, text],
+            text_info=[voice.voice_id, text],
             cache=cache,
             embedding=embedding,
             device=self.device,
             flow_prompt_token=flow_prompt_token,
             speech_feat=speech_feat,
-            use_phoneme=USE_PHONEME,
+            use_phoneme=self.settings.use_phoneme,
         )
         return tts_speech
-
-
-ENGINE = InferenceEngine()
 
 
 # ---------------------------------------------------------------------------
@@ -346,81 +317,8 @@ def _wav_to_mp3_bytes(wav_bytes: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Startup
+# Request models
 # ---------------------------------------------------------------------------
-
-async def _load_engine() -> None:
-    """Load models in a background thread so /health stays responsive."""
-    try:
-        await asyncio.to_thread(ENGINE.load)
-    except Exception as exc:
-        logger.exception("Inference engine failed to load")
-        ENGINE.ready = False
-        ENGINE.startup_error = str(exc)
-
-
-@app.on_event("startup")
-async def on_startup():
-    load_authorized_keys(AUTH_KEYS_FILE)
-    scan_voices()
-    if DEFAULT_VOICE_STR and DEFAULT_VOICE_STR not in VOICE_REGISTRY:
-        logger.warning(
-            f"GLM_TTS_DEFAULT_VOICE='{DEFAULT_VOICE_STR}' does not match any "
-            f"registered voice; speech requests without an explicit voice will fail"
-        )
-    else:
-        logger.info(f"Default voice: {_pick_default(VOICE_REGISTRY, DEFAULT_VOICE_STR)}")
-    asyncio.create_task(_load_engine())
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/ready")
-def ready():
-    payload = {"ready": ENGINE.ready, "mock": MOCK_INFERENCE}
-    if not ENGINE.ready and ENGINE.startup_error:
-        payload["error"] = ENGINE.startup_error
-    return payload
-
-
-@app.get("/version")
-def version():
-    """Public build stamp: which image revision is running."""
-    return {"version": GIT_SHA, "mock": MOCK_INFERENCE}
-
-
-@app.get("/status")
-def server_status(_=Depends(verify_auth())):
-    """Quick operational check: config, uptime, and request stats."""
-    payload = {
-        "version": GIT_SHA,
-        "ready": ENGINE.ready,
-        "mock": MOCK_INFERENCE,
-        "device": str(ENGINE.device) if ENGINE.device is not None else DEVICE_STR,
-        "dtype": str(ENGINE.dtype).replace("torch.", "") if ENGINE.dtype is not None else DTYPE_STR,
-        "sample_rate": SAMPLE_RATE,
-        "uptime_seconds": round(time.time() - STARTED_AT, 1),
-        "voices": len(VOICE_REGISTRY),
-        "default_voice": _pick_default(VOICE_REGISTRY, DEFAULT_VOICE_STR),
-        "generating": ENGINE.lock.locked(),
-        "stats": dict(STATS),
-    }
-    if not ENGINE.ready and ENGINE.startup_error:
-        payload["startup_error"] = ENGINE.startup_error
-    return payload
-
-
-@app.get("/v1/models")
-def list_models(_=Depends(verify_auth())):
-    return {"data": [{"id": "glm-tts", "object": "model", "owned_by": "zai-org"}]}
-
 
 class SpeechRequest(BaseModel):
     model: str = "glm-tts"
@@ -430,157 +328,272 @@ class SpeechRequest(BaseModel):
     speed: float = 1.0
 
 
-@app.post("/v1/audio/speech")
-async def create_speech(req: SpeechRequest, _=Depends(verify_auth(["speech:generate"]))):
-    if not ENGINE.ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Inference engine is not ready yet",
-        )
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
 
-    if req.response_format not in ("wav", "mp3"):
-        raise HTTPException(status_code=400, detail="response_format must be 'wav' or 'mp3'")
+def create_app(settings: Settings) -> FastAPI:
+    """Build the FastAPI app for the given settings.
 
-    if not req.input.strip():
-        raise HTTPException(status_code=400, detail="input text cannot be empty")
+    All mutable state (auth keys, voice registry, engine, stats) is created
+    per instance and exposed on app.state, so apps are independent and
+    tests never share state with production or each other.
+    """
+    auth = AuthState()
+    voices: Dict[str, VoiceEntry] = {}
+    voice_lock = asyncio.Lock()
+    engine = InferenceEngine(settings)
+    started_at = time.time()
+    # Lightweight request stats (in-memory; reset on restart). A "quick
+    # check" for /status — anything heavier belongs in an SSH session.
+    stats = {
+        "speech_requests": 0,
+        "failed_requests": 0,
+        "audio_seconds_generated": 0.0,
+        "last_generation_seconds": None,
+    }
 
-    voice_id = resolve_voice(req.voice, VOICE_REGISTRY, DEFAULT_VOICE_STR)
-
-    STATS["speech_requests"] += 1
-    async with ENGINE.lock:
-        t0 = time.monotonic()
+    async def _load_engine() -> None:
+        """Load models in a background thread so /health stays responsive."""
         try:
-            wav = await asyncio.to_thread(ENGINE.synthesize, req.input, voice_id)
-        except Exception:
-            STATS["failed_requests"] += 1
-            raise
-        STATS["last_generation_seconds"] = round(time.monotonic() - t0, 2)
-        STATS["audio_seconds_generated"] = round(
-            STATS["audio_seconds_generated"] + wav.shape[-1] / SAMPLE_RATE, 2
-        )
-        wav_bytes = _tensor_to_wav_bytes(wav, SAMPLE_RATE)
+            await asyncio.to_thread(engine.load)
+        except Exception as exc:
+            logger.exception("Inference engine failed to load")
+            engine.ready = False
+            engine.startup_error = str(exc)
 
-    if req.response_format == "mp3":
-        audio_bytes = _wav_to_mp3_bytes(wav_bytes)
-        media_type = "audio/mpeg"
-    else:
-        audio_bytes = wav_bytes
-        media_type = "audio/wav"
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Fail-closed: a malformed keys file aborts startup (see auth.py).
+        load_authorized_keys(auth, settings.auth_keys_file)
+        scan_voices(settings.voices_dir, voices)
+        if settings.default_voice and settings.default_voice not in voices:
+            logger.warning(
+                f"GLM_TTS_DEFAULT_VOICE='{settings.default_voice}' does not match any "
+                f"registered voice; speech requests without an explicit voice will fail"
+            )
+        else:
+            logger.info(f"Default voice: {_pick_default(voices, settings.default_voice)}")
+        asyncio.create_task(_load_engine())
+        yield
 
-    return Response(content=audio_bytes, media_type=media_type)
+    app = FastAPI(title="GLM-TTS Server", version="0.1.0", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.auth = auth
+    app.state.voices = voices
+    app.state.engine = engine
+    app.state.stats = stats
+    app.state.started_at = started_at
 
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
 
-@app.post("/v1/voices")
-async def create_voice(
-    name: str = Form(...),
-    prompt_text: str = Form(...),
-    prompt_audio: UploadFile = File(...),
-    voice_id: Optional[str] = Form(None),
-    _=Depends(verify_auth(["voices:manage"])),
-):
-    if not voice_id:
-        voice_id = f"voice_{uuid.uuid4().hex[:12]}"
-    voice_id = voice_id.strip()
-    if not voice_id:
-        raise HTTPException(status_code=400, detail="voice_id cannot be empty")
+    @app.get("/ready")
+    def ready():
+        payload = {"ready": engine.ready, "mock": settings.mock_inference}
+        if not engine.ready and engine.startup_error:
+            payload["error"] = engine.startup_error
+        return payload
 
-    # Only allow simple IDs to avoid path traversal
-    safe_id = "".join(c for c in voice_id if c.isalnum() or c in "-_")
-    if not safe_id or safe_id != voice_id:
-        raise HTTPException(status_code=400, detail="voice_id must be alphanumeric with '-' or '_'")
+    @app.get("/version")
+    def version():
+        """Public build stamp: which image revision is running."""
+        return {"version": settings.git_sha, "mock": settings.mock_inference}
 
-    content = await prompt_audio.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Audio file exceeds {MAX_UPLOAD_BYTES} bytes ({len(content)} bytes uploaded)",
-        )
-
-    async with VOICE_LOCK:
-        voice_path = Path(VOICES_DIR) / safe_id
-        if voice_path.exists():
-            raise HTTPException(status_code=409, detail=f"Voice '{safe_id}' already exists")
-
-        voice_path.mkdir(parents=True, exist_ok=False)
-        audio_path = voice_path / "prompt_audio.wav"
-
-        try:
-            # Save uploaded audio to a temporary file with the original extension so pydub can detect format
-            original_name = prompt_audio.filename or "upload.bin"
-            suffix = Path(original_name).suffix or ".bin"
-            tmp_path = voice_path / f"upload_{int(time.time())}{suffix}"
-            with open(tmp_path, "wb") as f:
-                f.write(content)
-
-            # Convert/resample to WAV at the model sample rate, mono
-            audio = AudioSegment.from_file(tmp_path)
-            audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
-            audio.export(str(audio_path), format="wav")
-
-            os.remove(tmp_path)
-        except Exception as e:
-            shutil.rmtree(voice_path, ignore_errors=True)
-            logger.error(f"Failed to process voice upload: {e}")
-            raise HTTPException(status_code=400, detail=f"Could not process audio file: {e}")
-
-        created_at = datetime.now(timezone.utc).isoformat()
-        metadata = {
-            "voice_id": safe_id,
-            "name": name,
-            "prompt_text": prompt_text,
-            "created_at": created_at,
+    @app.get("/status")
+    def server_status(_=Depends(verify_auth())):
+        """Quick operational check: config, uptime, and request stats."""
+        payload = {
+            "version": settings.git_sha,
+            "ready": engine.ready,
+            "mock": settings.mock_inference,
+            "device": str(engine.device) if engine.device is not None else settings.device,
+            "dtype": (
+                str(engine.dtype).replace("torch.", "")
+                if engine.dtype is not None
+                else settings.dtype
+            ),
+            "sample_rate": settings.sample_rate,
+            "uptime_seconds": round(time.time() - started_at, 1),
+            "voices": len(voices),
+            "default_voice": _pick_default(voices, settings.default_voice),
+            "generating": engine.lock.locked(),
+            "stats": dict(stats),
         }
-        with open(_voice_meta_path(voice_path), "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        if not engine.ready and engine.startup_error:
+            payload["startup_error"] = engine.startup_error
+        return payload
 
-        voice = _load_voice_from_disk(voice_path)
-        if voice:
-            VOICE_REGISTRY[safe_id] = voice
+    @app.get("/v1/models")
+    def list_models(_=Depends(verify_auth())):
+        return {"data": [{"id": "glm-tts", "object": "model", "owned_by": "zai-org"}]}
 
-        return {"voice_id": safe_id, "name": name, "created_at": created_at}
+    @app.post("/v1/audio/speech")
+    async def create_speech(
+        req: SpeechRequest, _=Depends(verify_auth(["speech:generate"]))
+    ):
+        if not engine.ready:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Inference engine is not ready yet",
+            )
 
+        if req.response_format not in ("wav", "mp3"):
+            raise HTTPException(
+                status_code=400, detail="response_format must be 'wav' or 'mp3'"
+            )
 
-@app.get("/v1/voices")
-def list_voices(_=Depends(verify_auth(["voices:read"]))):
-    return {
-        "voices": [
-            {
-                "voice_id": v.voice_id,
-                "name": v.name,
-                "created_at": v.created_at,
+        if not req.input.strip():
+            raise HTTPException(status_code=400, detail="input text cannot be empty")
+
+        voice_id = resolve_voice(req.voice, voices, settings.default_voice)
+        voice = voices[voice_id]
+
+        stats["speech_requests"] += 1
+        async with engine.lock:
+            t0 = time.monotonic()
+            try:
+                wav = await asyncio.to_thread(engine.synthesize, req.input, voice)
+            except Exception:
+                stats["failed_requests"] += 1
+                raise
+            stats["last_generation_seconds"] = round(time.monotonic() - t0, 2)
+            stats["audio_seconds_generated"] = round(
+                stats["audio_seconds_generated"] + wav.shape[-1] / settings.sample_rate, 2
+            )
+            wav_bytes = _tensor_to_wav_bytes(wav, settings.sample_rate)
+
+        if req.response_format == "mp3":
+            audio_bytes = _wav_to_mp3_bytes(wav_bytes)
+            media_type = "audio/mpeg"
+        else:
+            audio_bytes = wav_bytes
+            media_type = "audio/wav"
+
+        return Response(content=audio_bytes, media_type=media_type)
+
+    @app.post("/v1/voices")
+    async def create_voice(
+        name: str = Form(...),
+        prompt_text: str = Form(...),
+        prompt_audio: UploadFile = File(...),
+        voice_id: Optional[str] = Form(None),
+        _=Depends(verify_auth(["voices:manage"])),
+    ):
+        if not voice_id:
+            voice_id = f"voice_{uuid.uuid4().hex[:12]}"
+        voice_id = voice_id.strip()
+        if not voice_id:
+            raise HTTPException(status_code=400, detail="voice_id cannot be empty")
+
+        # Only allow simple IDs to avoid path traversal
+        safe_id = "".join(c for c in voice_id if c.isalnum() or c in "-_")
+        if not safe_id or safe_id != voice_id:
+            raise HTTPException(
+                status_code=400, detail="voice_id must be alphanumeric with '-' or '_'"
+            )
+
+        content = await prompt_audio.read()
+        if len(content) > settings.max_upload_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Audio file exceeds {settings.max_upload_bytes} bytes "
+                    f"({len(content)} bytes uploaded)"
+                ),
+            )
+
+        async with voice_lock:
+            voice_path = Path(settings.voices_dir) / safe_id
+            if voice_path.exists():
+                raise HTTPException(status_code=409, detail=f"Voice '{safe_id}' already exists")
+
+            voice_path.mkdir(parents=True, exist_ok=False)
+            audio_path = voice_path / "prompt_audio.wav"
+
+            try:
+                # Save uploaded audio to a temporary file with the original
+                # extension so pydub can detect the format.
+                original_name = prompt_audio.filename or "upload.bin"
+                suffix = Path(original_name).suffix or ".bin"
+                tmp_path = voice_path / f"upload_{int(time.time())}{suffix}"
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+
+                # Convert/resample to WAV at the model sample rate, mono
+                audio = AudioSegment.from_file(tmp_path)
+                audio = audio.set_frame_rate(settings.sample_rate).set_channels(1).set_sample_width(2)
+                audio.export(str(audio_path), format="wav")
+
+                os.remove(tmp_path)
+            except Exception as e:
+                shutil.rmtree(voice_path, ignore_errors=True)
+                logger.error(f"Failed to process voice upload: {e}")
+                raise HTTPException(status_code=400, detail=f"Could not process audio file: {e}")
+
+            created_at = datetime.now(timezone.utc).isoformat()
+            metadata = {
+                "voice_id": safe_id,
+                "name": name,
+                "prompt_text": prompt_text,
+                "created_at": created_at,
             }
-            for v in VOICE_REGISTRY.values()
-        ]
-    }
+            with open(_voice_meta_path(voice_path), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
+            voice = _load_voice_from_disk(voice_path)
+            if voice:
+                voices[safe_id] = voice
 
-@app.get("/v1/voices/{voice_id}")
-def get_voice(voice_id: str, _=Depends(verify_auth(["voices:read"]))):
-    if voice_id not in VOICE_REGISTRY:
-        raise HTTPException(status_code=404, detail="Voice not found")
-    v = VOICE_REGISTRY[voice_id]
-    return {
-        "voice_id": v.voice_id,
-        "name": v.name,
-        "prompt_text": v.prompt_text,
-        "created_at": v.created_at,
-    }
+            return {"voice_id": safe_id, "name": name, "created_at": created_at}
 
+    @app.get("/v1/voices")
+    def list_voices(_=Depends(verify_auth(["voices:read"]))):
+        return {
+            "voices": [
+                {
+                    "voice_id": v.voice_id,
+                    "name": v.name,
+                    "created_at": v.created_at,
+                }
+                for v in voices.values()
+            ]
+        }
 
-@app.delete("/v1/voices/{voice_id}")
-async def delete_voice(voice_id: str, _=Depends(verify_auth(["voices:manage"]))):
-    async with VOICE_LOCK:
-        if voice_id not in VOICE_REGISTRY:
+    @app.get("/v1/voices/{voice_id}")
+    def get_voice(voice_id: str, _=Depends(verify_auth(["voices:read"]))):
+        if voice_id not in voices:
             raise HTTPException(status_code=404, detail="Voice not found")
-        voice_path = VOICE_REGISTRY[voice_id].path
-        del VOICE_REGISTRY[voice_id]
-        shutil.rmtree(voice_path, ignore_errors=True)
-    return {"deleted": True, "voice_id": voice_id}
+        v = voices[voice_id]
+        return {
+            "voice_id": v.voice_id,
+            "name": v.name,
+            "prompt_text": v.prompt_text,
+            "created_at": v.created_at,
+        }
+
+    @app.delete("/v1/voices/{voice_id}")
+    async def delete_voice(voice_id: str, _=Depends(verify_auth(["voices:manage"]))):
+        async with voice_lock:
+            if voice_id not in voices:
+                raise HTTPException(status_code=404, detail="Voice not found")
+            voice_path = voices[voice_id].path
+            del voices[voice_id]
+            shutil.rmtree(voice_path, ignore_errors=True)
+        return {"deleted": True, "voice_id": voice_id}
+
+    return app
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Uvicorn target (`uvicorn api.server:app`). Settings are read from the
+# GLM_TTS_* environment here, once, for the production process.
+app = create_app(Settings())
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=app.state.settings.port, log_level="info")
