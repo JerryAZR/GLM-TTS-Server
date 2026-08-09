@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import os
+import random
 import shutil
 import time
 import uuid
@@ -246,7 +247,7 @@ class InferenceEngine:
 
         return prompt_text, prompt_text_token, cache_speech_token, flow_prompt_token, speech_feat, embedding
 
-    def synthesize(self, text: str, voice: VoiceEntry) -> torch.Tensor:
+    def synthesize(self, text: str, voice: VoiceEntry, seed: int = 0) -> torch.Tensor:
         if self.settings.mock_inference:
             # 1 second of silence-ish dummy sine wave at the target sample rate
             t = torch.linspace(0, 1, self.settings.sample_rate, dtype=torch.float32)
@@ -286,13 +287,61 @@ class InferenceEngine:
             flow_prompt_token=flow_prompt_token,
             speech_feat=speech_feat,
             use_phoneme=self.settings.use_phoneme,
+            seed=seed,
         )
         return tts_speech
 
 
 # ---------------------------------------------------------------------------
-# Audio helpers
+# Degenerate-output detection and retry
 # ---------------------------------------------------------------------------
+
+# Normal speech is ~3-4 words/sec (English) or ~3-5 chars/sec (Chinese), so
+# output shorter than this fraction of the text's plausible minimum indicates
+# the LLM emitted EOS almost immediately (a deterministic-seed sampling
+# failure). Gated at _MIN_UNITS so short utterances ("Hi.") never trigger.
+_MIN_SECONDS_PER_UNIT = 0.15
+_MIN_UNITS = 4
+MAX_GENERATION_ATTEMPTS = 3
+
+
+def _text_units(text: str) -> int:
+    """Rough spoken-length units: CJK characters plus non-CJK words."""
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    non_cjk = "".join(" " if "\u4e00" <= c <= "\u9fff" else c for c in text)
+    return cjk + len(non_cjk.split())
+
+
+def _is_degenerate_output(text: str, seconds: float) -> bool:
+    units = _text_units(text)
+    return units >= _MIN_UNITS and seconds < _MIN_SECONDS_PER_UNIT * units
+
+
+async def _generate_with_retry(
+    engine: InferenceEngine,
+    text: str,
+    voice: VoiceEntry,
+    sample_rate: int,
+    max_attempts: int = MAX_GENERATION_ATTEMPTS,
+):
+    """Generate speech, retrying with fresh random seeds when the output is
+    implausibly short for the text. Returns (wav, degenerate_flag); when all
+    attempts are degenerate, returns the longest one with the flag set."""
+    best_wav, best_seconds = None, -1.0
+    units = _text_units(text)
+    for attempt in range(1, max_attempts + 1):
+        seed = random.randint(0, 2**31 - 1)
+        wav = await asyncio.to_thread(engine.synthesize, text, voice, seed)
+        seconds = wav.shape[-1] / sample_rate
+        if seconds > best_seconds:
+            best_wav, best_seconds = wav, seconds
+        if not _is_degenerate_output(text, seconds):
+            return best_wav, False
+        logger.warning(
+            f"Degenerate output ({seconds:.2f}s for {units}-unit text) with seed {seed}"
+            + ("; retrying with a new seed" if attempt < max_attempts else "; returning best attempt")
+        )
+    return best_wav, True
 
 def _tensor_to_wav_bytes(wav: torch.Tensor, sample_rate: int) -> bytes:
     wav = wav.detach().cpu().squeeze().numpy()
@@ -454,7 +503,9 @@ def create_app(settings: Settings) -> FastAPI:
         async with engine.lock:
             t0 = time.monotonic()
             try:
-                wav = await asyncio.to_thread(engine.synthesize, req.input, voice)
+                wav, degenerate = await _generate_with_retry(
+                    engine, req.input, voice, settings.sample_rate
+                )
             except Exception:
                 stats["failed_requests"] += 1
                 raise
@@ -471,7 +522,8 @@ def create_app(settings: Settings) -> FastAPI:
             audio_bytes = wav_bytes
             media_type = "audio/wav"
 
-        return Response(content=audio_bytes, media_type=media_type)
+        headers = {"X-GLM-TTS-Warning": "degenerate-output"} if degenerate else None
+        return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
     @app.post("/v1/voices")
     async def create_voice(

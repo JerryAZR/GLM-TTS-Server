@@ -79,6 +79,56 @@ def test_create_speech_mock(client):
 
 
 # ---------------------------------------------------------------------------
+# Degenerate-output retry
+# ---------------------------------------------------------------------------
+
+import torch
+
+from api.server import _is_degenerate_output
+
+
+def test_is_degenerate_output():
+    # The real failure case: 9 words, 0.84s of output.
+    text = "Narration drives the entire timeline of the video."
+    assert _is_degenerate_output(text, 0.84) is True
+    assert _is_degenerate_output(text, 3.12) is False
+    # Short utterances never trigger, regardless of duration.
+    assert _is_degenerate_output("Hi.", 0.3) is False
+    # Chinese: counted per character (12 chars here).
+    assert _is_degenerate_output("欢迎来到语音合成服务测试", 1.0) is True
+    assert _is_degenerate_output("欢迎来到语音合成服务测试", 3.0) is False
+
+
+def _fixed_wav(seconds, sample_rate=24000):
+    return torch.zeros(1, int(sample_rate * seconds))
+
+
+def test_retry_recovers_from_degenerate_output(client, app, monkeypatch):
+    """Short output triggers a retry with a new seed; the good take wins."""
+    engine = app.state.engine
+    calls = []
+
+    def fake_synthesize(text, voice, seed):
+        calls.append(seed)
+        return _fixed_wav(0.1 if len(calls) == 1 else 3.0)
+
+    monkeypatch.setattr(engine, "synthesize", fake_synthesize)
+    resp = _speech(client, input="This sentence is long enough to trigger the check.")
+    assert resp.status_code == 200
+    assert len(calls) == 2  # one degenerate attempt, one good
+    assert calls[0] != calls[1]  # fresh random seed per attempt
+    assert "x-glm-tts-warning" not in resp.headers
+
+
+def test_retry_returns_best_with_warning_when_all_degenerate(client, app, monkeypatch):
+    engine = app.state.engine
+    monkeypatch.setattr(engine, "synthesize", lambda text, voice, seed: _fixed_wav(0.1))
+    resp = _speech(client, input="This sentence is long enough to trigger the check.")
+    assert resp.status_code == 200
+    assert resp.headers.get("x-glm-tts-warning") == "degenerate-output"
+
+
+# ---------------------------------------------------------------------------
 # Default voice resolution
 # ---------------------------------------------------------------------------
 
