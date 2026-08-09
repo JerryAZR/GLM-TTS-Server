@@ -280,8 +280,19 @@ def step_voices(changed: list[str]) -> None:
         print("(ffmpeg not found: only .wav reference clips can be bundled;")
         print(" other formats can be uploaded via POST /v1/voices after deployment.)")
 
-    added: list[str] = []
+    # Personalization means YOUR voices - offer to clear the pre-existing
+    # (bundled) ones BEFORE adding new ones. All or nothing, one choice.
     pre_existing = sorted(p.name for p in VOICES_DIR.iterdir() if p.is_dir()) if VOICES_DIR.is_dir() else []
+    if pre_existing and ask_yes_no(
+        f"Remove all existing voices ({', '.join(pre_existing)})?", default=True
+    ):
+        for voice_id in pre_existing:
+            shutil.rmtree(VOICES_DIR / voice_id, ignore_errors=True)
+            print(f"  removed voices/{voice_id}/")
+        if "voices" not in changed:
+            changed.append("voices")
+
+    added: list[str] = []
     while True:
         if added and not ask_yes_no("\nAdd another voice?", default=False):
             break
@@ -352,15 +363,10 @@ def step_voices(changed: list[str]) -> None:
     if not added:
         current = read_dockerfile_default_voice()
         print(f"No voices added; default voice stays {current or 'auto-resolution'}.")
-        return
-
-    # Personalization means YOUR voices - offer to remove the bundled ones.
-    for voice_id in pre_existing:
-        if voice_id in added:
-            continue
-        if ask_yes_no(f"Remove existing voice '{voice_id}'?", default=False):
-            shutil.rmtree(VOICES_DIR / voice_id, ignore_errors=True)
-            print(f"  removed voices/{voice_id}/")
+        if current and not (VOICES_DIR / current).is_dir():
+            print(f"WARNING: default voice '{current}' no longer exists - requests")
+            print("without an explicit voice will fail until you add it or set")
+            print("GLM_TTS_DEFAULT_VOICE to an existing voice.")
 
 
 def step_commit(changed: list[str]) -> None:

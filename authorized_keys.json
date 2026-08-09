@@ -1,7 +1,7 @@
 {
   "keys": [
     {
-      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0mUW/SOJbZUGc3pLCKNbl366zN0IM+Y/fMceNNcCdJ",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0mUW/SOJbZUGc3pLCKNbl366zN0IM+Y/fMceNNcCdJ zerui.an@outlook.com",
       "role": "admin"
     }
   ]
