@@ -56,12 +56,15 @@ else
     echo "[runpod-start] Model download complete."
 fi
 
-# Ensure the voices directory exists and seed it with bundled voices if empty.
+# Seed the voices directory from the bundled voices on EVERY boot: the image
+# is authoritative for bundled voice IDs (copy with replace). Voices uploaded
+# via the API under other IDs are left untouched. Deleting a bundled voice via
+# the API is therefore not permanent - it returns on the next pod start.
 VOICES_DIR="${GLM_TTS_VOICES_DIR:-/workspace/voices}"
 mkdir -p "${VOICES_DIR}"
-if [ -z "$(ls -A "${VOICES_DIR}" 2>/dev/null)" ] && [ -d /app/voices ]; then
-    echo "[runpod-start] Seeding voices directory from bundled voices..."
-    cp -r /app/voices/* "${VOICES_DIR}/"
+if [ -d /app/voices ]; then
+    echo "[runpod-start] Syncing bundled voices into ${VOICES_DIR} ..."
+    cp -rf /app/voices/. "${VOICES_DIR}/"
 fi
 
 cd /app

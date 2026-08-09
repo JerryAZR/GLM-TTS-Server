@@ -92,6 +92,25 @@ It prints a token good for one hour (see `--expires`, `--sub` for options). The 
 
 ---
 
+## Personalizing Your Deployment (Setup Wizard)
+
+The repo ships with a bundled demo voice (`voices/jerry/`) and the maintainer's public key so a fresh deploy "just works". To make it yours: **fork the repo** (or use it as a GitHub template), clone your copy, then run the interactive wizard once — standard library only, any Python 3.9+:
+
+```bash
+python scripts/setup_wizard.py
+```
+
+It will:
+
+1. **Show the current configuration** and ask before changing anything (declining leaves everything untouched).
+2. **Configure authentication** — enroll an SSH public key (auto-detected from `~/.ssh`, pasted, or freshly generated via `ssh-keygen`), choose open/public mode, or keep the current file.
+3. **Add your voice(s)** — a reference clip (`.wav` directly, any format if `ffmpeg` is installed) plus its exact transcript. The **first voice you add becomes the default**: the wizard rewrites `GLM_TTS_DEFAULT_VOICE` in the Dockerfile, so the default travels with the image and works on RunPod with zero env configuration.
+4. **Commit the changes** (prompting for a repo-local git identity if missing) and remind you to push — CI then builds an image carrying your key, your voices, and your default voice.
+
+Only the paths the wizard touched are staged. It is safe to re-run or interrupt (Ctrl+C) — changes made so far are listed on exit.
+
+---
+
 ## Local Install and Run
 
 ### 1. Clone the fork
@@ -167,7 +186,7 @@ docker push your-registry/glm-tts-server:latest
 5. Attach a **Network Volume** of **at least 30 GB** and mount it at `/workspace`.
    - The default 5 GB container disk is **too small**: the model download is multi-GB, and without a volume neither checkpoints nor voices persist across pod stops.
    - On first boot, the image will download `zai-org/GLM-TTS` into `/workspace/ckpt`. Completeness is validated on every boot (`.download-complete` marker, falling back to checking the actual model files): a partial download is wiped and retried, while a complete checkpoint copied in by other means is adopted as-is.
-   - The bundled `jerry` sample voice is copied into `/workspace/voices` on first boot if that directory is empty; uploaded voices are persisted there too.
+   - Bundled voices are synced into `/workspace/voices` on **every** boot (the image is authoritative for bundled voice IDs, so deleting one via the API is not permanent — it returns on the next start). Voices you upload under other IDs persist on the volume and are never touched by the sync.
 6. (Optional) set other environment variables such as:
    - `GLM_TTS_DTYPE` (default `float16`)
    - `GLM_TTS_DEVICE` (default `auto`)
@@ -177,7 +196,7 @@ docker push your-registry/glm-tts-server:latest
 
 The server loads authorized public keys at startup. It checks `/workspace/authorized_keys.json` first (network volume), then falls back to `authorized_keys.json` in the image (`/app`). Since only **public** keys are involved, committing the file to the repo is safe and is the zero-maintenance option:
 
-**Option A — bake it into the image (recommended).** Generate a key locally (`ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"`), create `authorized_keys.json` in the repo root (see [Authentication](#authentication) and `authorized_keys.example.json`), and commit it. The file is copied into the image at `/app/authorized_keys.json` and loaded from the very first boot — the server is never public, and there is nothing to configure per deploy.
+**Option A — bake it into the image (recommended).** Generate a key locally (`ssh-keygen -t ed25519 -f glm-tts-key -C "glm-tts"`), create `authorized_keys.json` in the repo root (see [Authentication](#authentication) and `authorized_keys.example.json`), and commit it — or let `scripts/setup_wizard.py` do all of this for you. The file is copied into the image at `/app/authorized_keys.json` and loaded from the very first boot — the server is never public, and there is nothing to configure per deploy.
    - Only your **public** key ships in the image. Anyone can pull and run the image, but only the holder of the matching private key can authenticate — including to their own deployment, so keep the private key safe.
    - The server **fails to start** if a keys file exists but cannot be parsed (fail-closed); it is only public when no keys file exists at all.
 
