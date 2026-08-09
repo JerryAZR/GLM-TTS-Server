@@ -17,6 +17,7 @@ from setup_wizard import (
     set_dockerfile_default_voice,
     valid_voice_id,
     validate_openssh_line,
+    with_comment,
     write_authorized_keys,
 )
 
@@ -45,6 +46,14 @@ class TestValidateOpenSshLine:
             validate_openssh_line(f"ssh-ed25519 !!!not-base64!!!")
         with pytest.raises(ValueError):
             validate_openssh_line(f"unknown-type {FAKE_B64}")
+
+
+class TestWithComment:
+    def test_reattaches_comment(self):
+        assert with_comment("ssh-ed25519 AAAA", "me@host") == "ssh-ed25519 AAAA me@host"
+
+    def test_no_comment(self):
+        assert with_comment("ssh-ed25519 AAAA", "") == "ssh-ed25519 AAAA"
 
 
 class TestValidVoiceId:

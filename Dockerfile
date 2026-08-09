@@ -42,7 +42,7 @@ ENV GLM_TTS_DTYPE=float16
 ENV GLM_TTS_PORT=8000
 ENV GLM_TTS_MOCK_INFERENCE=0
 # Default voice when requests omit one. Personalized by scripts/setup_wizard.py.
-ENV GLM_TTS_DEFAULT_VOICE=jerry
+ENV GLM_TTS_DEFAULT_VOICE=my_voice
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000

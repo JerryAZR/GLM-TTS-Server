@@ -55,6 +55,11 @@ def valid_voice_id(voice_id: str) -> bool:
     return bool(voice_id) and all(c.isalnum() or c in "-_" for c in voice_id)
 
 
+def with_comment(line: str, comment: str) -> str:
+    """Reattach an OpenSSH comment (e.g. user@host) to a normalized key line."""
+    return f"{line} {comment}" if comment else line
+
+
 def read_dockerfile_default_voice(dockerfile: Path = DOCKERFILE) -> str:
     for line in dockerfile.read_text(encoding="utf-8").splitlines():
         if line.startswith(DEFAULT_VOICE_PREFIX):
@@ -203,14 +208,14 @@ def step_auth(changed: list[str]) -> None:
         idx = ask_menu("\nWhich key should be enrolled?", options)
 
         if idx < len(detected):
-            line = detected[idx][1]
+            line = with_comment(*detected[idx][1:])
         elif idx == len(detected):
             raw = ask("Path to .pub file, or paste the key line")
             candidate = Path(os.path.expanduser(raw))
             if candidate.is_file():
                 raw = candidate.read_text(encoding="utf-8").strip()
             try:
-                line, _ = validate_openssh_line(raw)
+                line = with_comment(*validate_openssh_line(raw))
             except ValueError as e:
                 print(f"  invalid key: {e}; skipping")
                 if not ask_yes_no("Try another key?"):
@@ -257,8 +262,9 @@ def generate_keypair() -> str | None:
         return None
     print(f"  generated {priv} (no passphrase - needed for non-interactive token minting)")
     try:
-        line, _ = validate_openssh_line(priv.with_suffix(priv.suffix + ".pub").read_text(encoding="utf-8").strip())
-        return line
+        pub_path = priv.with_suffix(priv.suffix + ".pub")
+        line, comment = validate_openssh_line(pub_path.read_text(encoding="utf-8").strip())
+        return with_comment(line, comment)
     except (ValueError, OSError) as e:
         print(f"  could not read generated public key: {e}")
         return None
@@ -275,6 +281,7 @@ def step_voices(changed: list[str]) -> None:
         print(" other formats can be uploaded via POST /v1/voices after deployment.)")
 
     added: list[str] = []
+    pre_existing = sorted(p.name for p in VOICES_DIR.iterdir() if p.is_dir()) if VOICES_DIR.is_dir() else []
     while True:
         if added and not ask_yes_no("\nAdd another voice?", default=False):
             break
@@ -345,6 +352,15 @@ def step_voices(changed: list[str]) -> None:
     if not added:
         current = read_dockerfile_default_voice()
         print(f"No voices added; default voice stays {current or 'auto-resolution'}.")
+        return
+
+    # Personalization means YOUR voices - offer to remove the bundled ones.
+    for voice_id in pre_existing:
+        if voice_id in added:
+            continue
+        if ask_yes_no(f"Remove existing voice '{voice_id}'?", default=False):
+            shutil.rmtree(VOICES_DIR / voice_id, ignore_errors=True)
+            print(f"  removed voices/{voice_id}/")
 
 
 def step_commit(changed: list[str]) -> None:
