@@ -208,15 +208,12 @@ def verify_auth(required_role: str = "user"):
         if not keys:
             return {}
 
-        token = credentials.credentials if credentials else ""
-        if not token:
+        if credentials is None or not credentials.credentials:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing Authorization header",
             )
 
-        if not token.startswith("Bearer "):
-            token = f"Bearer {token}"
-        return _verify_jwt(token, keys, required_role)
+        return _verify_jwt(f"Bearer {credentials.credentials}", keys, required_role)
 
     return _verify

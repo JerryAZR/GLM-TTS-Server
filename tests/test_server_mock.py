@@ -2,6 +2,9 @@
 # These run against a dedicated mock-mode app from conftest (no weights, no
 # GPU, no auth keys -> public access).
 
+import io
+import wave
+
 import pytest
 
 
@@ -126,6 +129,75 @@ def test_retry_returns_best_with_warning_when_all_degenerate(client, app, monkey
     resp = _speech(client, input="This sentence is long enough to trigger the check.")
     assert resp.status_code == 200
     assert resp.headers.get("x-glm-tts-warning") == "degenerate-output"
+
+
+# ---------------------------------------------------------------------------
+# Prompt-feature caching
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_features_cached_across_requests(client, app, registry, monkeypatch, tmp_path):
+    """Prompt-feature extraction runs once per VoiceEntry, not per request."""
+    engine = app.state.engine
+    voice_dir = tmp_path / "cached_voice"
+    voice_dir.mkdir()
+    (voice_dir / "prompt_audio.wav").write_bytes(b"RIFF")  # only existence is checked
+    registry["cached"] = VoiceEntry(
+        voice_id="cached", name="cached", prompt_text="t",
+        created_at="2026-01-01T00:00:00+00:00", path=voice_dir,
+    )
+
+    calls = []
+
+    def fake_extract(voice):
+        calls.append(voice.voice_id)
+        return (None, None, None, None, None, None)
+
+    monkeypatch.setattr(engine, "_extract_prompt_features", fake_extract)
+    monkeypatch.setattr(engine.settings, "mock_inference", False)
+    monkeypatch.setattr(
+        "api.server.generate_long", lambda **kw: (torch.zeros(1, 24000), None, None, None)
+    )
+
+    assert _speech(client, input="hi", voice="cached").status_code == 200
+    assert _speech(client, input="hi", voice="cached").status_code == 200
+    assert calls == ["cached"]  # extracted once, reused on the second request
+
+
+# ---------------------------------------------------------------------------
+# Voice upload
+# ---------------------------------------------------------------------------
+
+
+def _small_wav_bytes():
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\0\0" * 1600)
+    return buf.getvalue()
+
+
+def test_create_voice_returns_201(client, registry):
+    resp = client.post(
+        "/v1/voices",
+        data={"name": "upload-test", "prompt_text": "hello", "voice_id": "upload_test"},
+        files={"prompt_audio": ("prompt.wav", _small_wav_bytes(), "audio/wav")},
+    )
+    assert resp.status_code == 201
+    assert "upload_test" in registry
+
+
+def test_create_voice_rejects_oversized_upload(client, app, registry, monkeypatch):
+    monkeypatch.setattr(app.state.settings, "max_upload_bytes", 8)
+    resp = client.post(
+        "/v1/voices",
+        data={"name": "too-big", "prompt_text": "hello", "voice_id": "too_big"},
+        files={"prompt_audio": ("prompt.wav", _small_wav_bytes(), "audio/wav")},
+    )
+    assert resp.status_code == 413
+    assert "too_big" not in registry
 
 
 # ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@ import torch
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from pydub import AudioSegment
 
 from api.auth import AuthState, load_authorized_keys, verify_auth
@@ -73,6 +73,14 @@ class VoiceEntry(BaseModel):
     prompt_text: str
     created_at: str
     path: Path
+
+    # Extracted prompt features (text tokens, speech tokens, mel feat,
+    # speaker embedding), populated lazily on first synthesis. These depend
+    # only on the voice's prompt assets, never on the request text, so they
+    # are computed once per entry. Re-uploading a voice creates a NEW entry,
+    # so stale features can never be served. Private: excluded from
+    # serialization (tensors are not JSON-able).
+    _features: Optional[tuple] = PrivateAttr(default=None)
 
 
 def _pick_default(voices: Dict[str, VoiceEntry], configured_default: str = "") -> Optional[str]:
@@ -259,6 +267,8 @@ class InferenceEngine:
                 status_code=404, detail=f"Voice audio for '{voice.voice_id}' not found"
             )
 
+        if voice._features is None:
+            voice._features = self._extract_prompt_features(voice)
         (
             prompt_text,
             prompt_text_token,
@@ -266,7 +276,7 @@ class InferenceEngine:
             flow_prompt_token,
             speech_feat,
             embedding,
-        ) = self._extract_prompt_features(voice)
+        ) = voice._features
 
         cache = {
             "cache_text": [prompt_text],
@@ -374,7 +384,10 @@ class SpeechRequest(BaseModel):
     input: str = Field(..., min_length=1, max_length=5000)
     voice: Optional[str] = None  # resolved via resolve_voice() when omitted
     response_format: str = "wav"  # wav or mp3
-    speed: float = 1.0
+    speed: float = Field(
+        default=1.0,
+        description="Accepted for OpenAI API compatibility; currently ignored.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +538,7 @@ def create_app(settings: Settings) -> FastAPI:
         headers = {"X-GLM-TTS-Warning": "degenerate-output"} if degenerate else None
         return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
-    @app.post("/v1/voices")
+    @app.post("/v1/voices", status_code=201)
     async def create_voice(
         name: str = Form(...),
         prompt_text: str = Form(...),
@@ -546,14 +559,13 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=400, detail="voice_id must be alphanumeric with '-' or '_'"
             )
 
-        content = await prompt_audio.read()
+        # Read at most the cap + 1 byte so oversized uploads are rejected
+        # without buffering the entire body in memory.
+        content = await prompt_audio.read(settings.max_upload_bytes + 1)
         if len(content) > settings.max_upload_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=(
-                    f"Audio file exceeds {settings.max_upload_bytes} bytes "
-                    f"({len(content)} bytes uploaded)"
-                ),
+                detail=f"Audio file exceeds the {settings.max_upload_bytes}-byte limit",
             )
 
         async with voice_lock:
