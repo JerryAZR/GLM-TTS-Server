@@ -151,7 +151,7 @@ def test_prompt_features_cached_across_requests(client, app, registry, monkeypat
 
     def fake_extract(voice):
         calls.append(voice.voice_id)
-        return (None, None, None, None, None, None)
+        return (None, None, [], None, None, None)
 
     monkeypatch.setattr(engine, "_extract_prompt_features", fake_extract)
     monkeypatch.setattr(engine.settings, "mock_inference", False)
