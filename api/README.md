@@ -385,7 +385,7 @@ The server has **no pronunciation-hint mechanism** — no SSML, no phoneme tags 
 ## Notes
 
 - `speed` is accepted for OpenAI API compatibility but **currently ignored** — output is always generated at the model's natural rate.
-- Prompt features (speaker embedding, speech tokens, mel features) are extracted **once per voice** on its first synthesis and cached in memory; subsequent requests skip that GPU work. Re-uploading a voice creates a fresh entry, so its cache resets automatically.
+- Prompt features (speaker embedding, speech tokens, mel features) are extracted **once per voice** — at startup for scanned voices, at upload time for new ones (a reference clip the model cannot process fails the upload immediately) — and cached in memory. Re-uploading a voice creates a fresh entry, so its cache resets automatically.
 
 - Each speech request is a fresh **random sample** (no fixed seed). If the output is implausibly short for the input text — a known sampling failure mode where the model emits EOS almost immediately — the server retries with new seeds (up to 3 attempts) and returns the longest take. If every attempt is degenerate, the best one is returned with an `X-GLM-TTS-Warning: degenerate-output` header; clients can also implement best-of-N by simply repeating the request and keeping the best result.
 

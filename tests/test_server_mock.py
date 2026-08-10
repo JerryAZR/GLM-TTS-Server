@@ -198,6 +198,45 @@ def test_generation_does_not_mutate_cached_features(client, app, registry, monke
     assert stored_tokens == [[1, 2, 3]]  # never mutated by either request
 
 
+def test_warm_voice_features_extracts_and_tolerates_failures():
+    from types import SimpleNamespace
+
+    from api.server import warm_voice_features
+
+    ok = _fake_voice("ok")
+    bad = _fake_voice("bad")
+
+    def extract(voice):
+        if voice.voice_id == "bad":
+            raise RuntimeError("boom")
+        return ("features", voice.voice_id)
+
+    engine = SimpleNamespace(
+        settings=SimpleNamespace(mock_inference=False),
+        _extract_prompt_features=extract,
+    )
+    warm_voice_features(engine, {"ok": ok, "bad": bad})
+    assert ok._features == ("features", "ok")
+    assert bad._features is None  # failure tolerated; lazy fallback remains
+
+
+def test_warm_voice_features_skips_mock_mode():
+    from types import SimpleNamespace
+
+    from api.server import warm_voice_features
+
+    def extract(voice):
+        raise AssertionError("must not be called in mock mode")
+
+    engine = SimpleNamespace(
+        settings=SimpleNamespace(mock_inference=True),
+        _extract_prompt_features=extract,
+    )
+    voice = _fake_voice("v")
+    warm_voice_features(engine, {"v": voice})
+    assert voice._features is None
+
+
 # ---------------------------------------------------------------------------
 # Voice upload
 # ---------------------------------------------------------------------------

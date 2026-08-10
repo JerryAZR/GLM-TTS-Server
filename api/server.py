@@ -304,6 +304,25 @@ class InferenceEngine:
         return tts_speech
 
 
+def warm_voice_features(engine: InferenceEngine, voices: Dict[str, VoiceEntry]) -> None:
+    """Eagerly extract prompt features for every registered voice, so the
+    first synthesis per voice is fast and broken reference audio surfaces at
+    startup instead of mid-request. Skipped in mock mode (no frontends).
+    Per-voice failures are logged; the voice falls back to lazy extraction
+    on first synthesis."""
+    if engine.settings.mock_inference:
+        return
+    for voice in voices.values():
+        if voice._features is not None:
+            continue
+        try:
+            voice._features = engine._extract_prompt_features(voice)
+        except Exception:
+            logger.exception(
+                f"Prompt-feature extraction failed for voice '{voice.voice_id}'"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Degenerate-output detection and retry
 # ---------------------------------------------------------------------------
@@ -421,6 +440,7 @@ def create_app(settings: Settings) -> FastAPI:
         """Load models in a background thread so /health stays responsive."""
         try:
             await asyncio.to_thread(engine.load)
+            await asyncio.to_thread(warm_voice_features, engine, voices)
         except Exception as exc:
             logger.exception("Inference engine failed to load")
             engine.ready = False
@@ -610,6 +630,21 @@ def create_app(settings: Settings) -> FastAPI:
 
             voice = _load_voice_from_disk(voice_path)
             if voice:
+                # Eager feature extraction: a reference clip the model cannot
+                # process fails the upload NOW, not on first synthesis.
+                if not settings.mock_inference:
+                    try:
+                        async with engine.lock:
+                            voice._features = await asyncio.to_thread(
+                                engine._extract_prompt_features, voice
+                            )
+                    except Exception as e:
+                        logger.error(f"Reference audio unusable for '{safe_id}': {e}")
+                        shutil.rmtree(voice_path, ignore_errors=True)
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Could not extract voice features from the reference audio: {e}",
+                        )
                 voices[safe_id] = voice
 
             return {"voice_id": safe_id, "name": name, "created_at": created_at}
