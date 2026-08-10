@@ -164,6 +164,40 @@ def test_prompt_features_cached_across_requests(client, app, registry, monkeypat
     assert calls == ["cached"]  # extracted once, reused on the second request
 
 
+def test_generation_does_not_mutate_cached_features(client, app, registry, monkeypatch, tmp_path):
+    """Regression: the per-request generation cache must not alias the cached
+    feature list (generate_long appends to it in place, per chunk)."""
+    engine = app.state.engine
+    voice_dir = tmp_path / "alias_voice"
+    voice_dir.mkdir()
+    (voice_dir / "prompt_audio.wav").write_bytes(b"RIFF")
+    registry["alias"] = VoiceEntry(
+        voice_id="alias", name="alias", prompt_text="t",
+        created_at="2026-01-01T00:00:00+00:00", path=voice_dir,
+    )
+
+    stored_tokens = [[1, 2, 3]]
+    monkeypatch.setattr(
+        engine, "_extract_prompt_features",
+        lambda voice: ("t", [0], stored_tokens, None, None, None),
+    )
+    monkeypatch.setattr(engine.settings, "mock_inference", False)
+
+    def fake_generate_long(**kw):
+        cache = kw["cache"]
+        # Simulate generate_long's in-place per-chunk appends.
+        cache["cache_text"].append("chunk")
+        cache["cache_text_token"].append([9])
+        cache["cache_speech_token"].append([4, 5, 6])
+        return (torch.zeros(1, 24000), None, None, None)
+
+    monkeypatch.setattr("api.server.generate_long", fake_generate_long)
+
+    assert _speech(client, input="hi", voice="alias").status_code == 200
+    assert _speech(client, input="hi", voice="alias").status_code == 200
+    assert stored_tokens == [[1, 2, 3]]  # never mutated by either request
+
+
 # ---------------------------------------------------------------------------
 # Voice upload
 # ---------------------------------------------------------------------------

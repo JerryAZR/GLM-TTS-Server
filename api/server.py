@@ -281,7 +281,9 @@ class InferenceEngine:
         cache = {
             "cache_text": [prompt_text],
             "cache_text_token": [prompt_text_token],
-            "cache_speech_token": cache_speech_token,
+            # COPY the stored list: generate_long appends chunk tokens in
+            # place, and the cached list must never be mutated by a request.
+            "cache_speech_token": list(cache_speech_token),
             "use_cache": True,
         }
 
