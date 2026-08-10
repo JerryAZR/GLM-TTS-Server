@@ -461,7 +461,7 @@ def create_app(settings: Settings) -> FastAPI:
         asyncio.create_task(_load_engine())
         yield
 
-    app = FastAPI(title="GLM-TTS Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="GLM-TTS Server", version="0.1.1", lifespan=lifespan)
     app.state.settings = settings
     app.state.auth = auth
     app.state.voices = voices
