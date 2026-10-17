@@ -10,7 +10,7 @@
 #     -v /path/to/authorized_keys.json:/workspace/authorized_keys.json:ro \
 #     glm-tts-server:latest
 
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 

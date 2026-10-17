@@ -9,6 +9,18 @@ commit, and tag `vX.Y.Z`. Tags are **git-only** — container images are built
 per push to `main` (`:latest` / `:sha-<hash>`), so personalized forks always
 build from their own pushes.
 
+## [Unreleased]
+
+### Changed
+
+- **CUDA 12.8 / PyTorch 2.7.1 base image** (was CUDA 12.1 / torch 2.3.1):
+  torch 2.3.1 ships kernels only up to sm_90, so pods assigned Blackwell GPUs
+  (e.g. RTX PRO 4000/6000, sm_120) failed every synthesis with `CUDA error:
+  no kernel image is available for execution on the device`. The cu128 build
+  covers sm_75 through sm_120 (T4 / A10 / A100 / H100 / 4090 / 5090 /
+  Blackwell) in a single image. Known casualty: V100 (sm_70). Also bumps
+  onnxruntime-gpu 1.18 → 1.22 (CUDA 12 + cuDNN 9 stack).
+
 ## [0.1.1] - 2026-08-10
 
 ### Fixed
